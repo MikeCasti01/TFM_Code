@@ -1,10 +1,3 @@
-"""
-Filesystem utilities for the Master's Thesis project.
-
-This module contains helper functions for inspecting the project
-structure and datasets inside Kaggle notebooks.
-"""
-
 from collections import Counter
 from pathlib import Path
 
@@ -47,6 +40,25 @@ def print_directory_tree(root_path, max_depth=None):
                 )
 
     _walk(root)
+
+
+def print_kaggle_input_structure(input_root="/kaggle/input"):
+    """
+    Print the structure of every dataset mounted in /kaggle/input.
+    """
+    input_root = Path(input_root)
+
+    if not input_root.exists():
+        raise FileNotFoundError(f"{input_root} does not exist.")
+
+    print("\n========== KAGGLE INPUT DATASETS ==========\n")
+
+    for dataset in sorted(
+        [item for item in input_root.iterdir() if item.is_dir()]
+    ):
+        print(f"\nDataset: {dataset.name}")
+        print("-" * 60)
+        print_directory_tree(dataset)
 
 
 def count_files_by_extension(root_path):
