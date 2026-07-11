@@ -5,7 +5,6 @@ from pathlib import Path
 import functools
 import os
 import random
-
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,6 +15,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications.resnet import preprocess_input
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.utils.class_weight import compute_class_weight
 
 
 # ---------------------------------------------------------------------------
@@ -908,6 +908,69 @@ def get_data_generator(
     dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
 
     return dataset
+
+
+def compute_class_weights(
+    df: pd.DataFrame,
+    level: str = "fine",
+) -> tuple[dict[int, float], float]:
+    """
+    Calcular balanced class weights y class imbalance ratio.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Metadata DataFrame.
+
+    level : str
+        Taxonomic level:
+        "macro", "coarse" o "fine".
+
+    Returns
+    -------
+    class_weight_dict : dict[int, float]
+
+    imbalance_ratio : float
+    """
+
+    level = level.lower()
+
+    label_columns = {
+        "macro": "Macro ID",
+        "coarse": "Coarse ID",
+        "fine": "Fine ID",
+    }
+
+    try:
+        label_col = label_columns[level]
+    except KeyError:
+        raise ValueError(
+            "TAXONOMIC LEVEL debe ser 'macro', 'coarse' o 'fine'."
+        )
+
+    labels = df[label_col].astype(np.int32)
+
+    counts = labels.value_counts()
+
+    imbalance_ratio = (
+        counts.max() /
+        counts.min()
+    )
+
+    classes = np.sort(labels.unique())
+
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=labels,
+    )
+
+    class_weight_dict = {
+        int(c): float(w)
+        for c, w in zip(classes, weights)
+    }
+
+    return class_weight_dict, imbalance_ratio
 
 
 # ---------------------------------------------------------------------------
