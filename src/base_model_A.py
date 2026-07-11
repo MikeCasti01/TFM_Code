@@ -1,3 +1,4 @@
+from tensorflow.keras import models
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -918,6 +919,9 @@ def build_model(
     input_shape: tuple[int, int, int] = (224, 224, 3),
     learning_rate: float = 1e-4,
     fine_tune_at: int | None = None,
+    optimizer_name: str = "adamw",
+    weight_decay: float = 1e-4,
+    label_smoothing: float = 0.1,
 ) -> keras.Model:
     """Construye y compila un modelo de red neuronal convolucional basado en ResNet152.
 
@@ -930,11 +934,17 @@ def build_model(
         num_classes (int): Cantidad de clases en la capa de salida.
         input_shape (tuple[int, int, int], optional): Dimensiones de entrada (alto, ancho, canales).
             Por defecto es (224, 224, 3).
-        learning_rate (float, optional): Tasa de aprendizaje inicial para el optimizador Adam.
+        learning_rate (float, optional): Tasa de aprendizaje inicial para el optimizador AdamW.
             Por defecto es 1e-4.
         fine_tune_at (int, optional): Índice de capa a partir del cual se descongelarán
             las capas del extractor de características para el ajuste fino.
             Si es None, se congela por completo el extractor.
+        optimizer_name (str, optional): Nombre del optimizador a usar. 
+            'adamw', o 'adam'.
+        weight_decay (float, optional): Tasa de decaimiento de peso para optimizadores
+            que lo soportan (AdamW, SGD). Por defecto es 1e-4.
+        label_smoothing (float, optional): Suavizado de etiquetas. 0.0 = estándar,
+            0.1 = suave. Por defecto es 0.1.
 
     Returns:
         keras.Model: Modelo de Keras compilado y listo para entrenar.
@@ -962,15 +972,36 @@ def build_model(
     # en modo de inferencia y no destruyan los pesos aprendidos de ImageNet
     x = base_model(inputs, training=False)
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    x = layers.Dropout(0.3)(x)
+    outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
 
     model = keras.Model(inputs, outputs)
 
+    # Crear el optimizador
+    optimizer_name = optimizer_name.lower()
+
+    if optimizer_name == "adam":
+        optimizer = keras.optimizers.Adam(
+            learning_rate=learning_rate
+        )
+
+    elif optimizer_name == "adamw":
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+    else:
+        raise ValueError(
+            "Optimizador no soportado. Utilice 'adam' o 'adamw'."
+        )
+
     # Compilar el modelo
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="sparse_categorical_crossentropy",
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(
+            label_smoothing=label_smoothing
+        ),
         metrics=["accuracy"],
     )
 
