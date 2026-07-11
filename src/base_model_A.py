@@ -1081,6 +1081,7 @@ def train_model(
     val_dataset: tf.data.Dataset,
     epochs: int = 20,
     callbacks: list | None = None,
+    class_weight: dict[int, float] | None = None,
 ) -> keras.callbacks.History:
     """Entrena el modelo utilizando los datasets proporcionados y callbacks configurados.
 
@@ -1117,6 +1118,7 @@ def train_model(
         validation_data=val_dataset,
         epochs=epochs,
         callbacks=callbacks,
+        class_weight=class_weight,
     )
 
     return history
