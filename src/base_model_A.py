@@ -984,7 +984,6 @@ def build_model(
     fine_tune_at: int | None = None,
     optimizer_name: str = "adamw",
     weight_decay: float = 1e-4,
-    label_smoothing: float = 0.1,
 ) -> keras.Model:
     """Construye y compila un modelo de red neuronal convolucional basado en ResNet152.
 
@@ -1006,8 +1005,6 @@ def build_model(
             'adamw', o 'adam'.
         weight_decay (float, optional): Tasa de decaimiento de peso para optimizadores
             que lo soportan (AdamW, SGD). Por defecto es 1e-4.
-        label_smoothing (float, optional): Suavizado de etiquetas. 0.0 = estándar,
-            0.1 = suave. Por defecto es 0.1.
 
     Returns:
         keras.Model: Modelo de Keras compilado y listo para entrenar.
@@ -1062,9 +1059,7 @@ def build_model(
     # Compilar el modelo
     model.compile(
         optimizer=optimizer,
-        loss=keras.losses.SparseCategoricalCrossentropy(
-            label_smoothing=label_smoothing
-        ),
+        loss=keras.losses.SparseCategoricalCrossentropy(),
         metrics=["accuracy"],
     )
 
