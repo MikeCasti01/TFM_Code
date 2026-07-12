@@ -873,8 +873,22 @@ def augment_image(
 
     if config.use_group_strategy:
         # Seleccionar un grupo de forma aleatoria y aplicar solo ese grupo
-        group_idx = int(tf.random.uniform(shape=[], minval=0, maxval=len(_GROUP_FUNCTIONS), dtype=tf.int32))
-        image = _GROUP_FUNCTIONS[group_idx](image, config)
+        group_idx = tf.random.uniform(
+            shape=[],
+            minval=0,
+            maxval=4,
+            dtype=tf.int32,
+        )
+
+        image = tf.switch_case(
+            branch_index=group_idx,
+            branch_fns={
+                0: lambda: _augment_group_geometrico(image, config),
+                1: lambda: _augment_group_fotometrico(image, config),
+                2: lambda: _augment_group_desenfoque_ruido(image, config),
+                3: lambda: _augment_group_borrado(image, config),
+            },
+        )
         return image, label
 
     # --- Modo clásico: aplicar todas las augmentaciones habilitadas ---
@@ -1291,8 +1305,7 @@ def build_model(
     # Definir la arquitectura usando la API funcional de Keras
     inputs = keras.Input(shape=input_shape)
 
-    # training=False: BN usa estadísticas móviles de ImageNet (extracción de features).
-    # Como se solicitó, mantenemos training=False incluso durante el fine-tuning
+    # Mantenemos training=False incluso durante el fine-tuning
     # para que BatchNormalization no actualice sus estadísticas móviles (buenas prácticas).
     bn_training_mode = False
     x = base_model(inputs, training=bn_training_mode)
