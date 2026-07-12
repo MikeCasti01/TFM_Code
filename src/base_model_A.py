@@ -14,8 +14,8 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications.resnet import preprocess_input
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
 
@@ -873,7 +873,7 @@ def augment_image(
 
     if config.use_group_strategy:
         # Seleccionar un grupo de forma aleatoria y aplicar solo ese grupo
-        group_idx = random.randint(0, len(_GROUP_FUNCTIONS) - 1)
+        group_idx = int(tf.random.uniform(shape=[], minval=0, maxval=len(_GROUP_FUNCTIONS), dtype=tf.int32))
         image = _GROUP_FUNCTIONS[group_idx](image, config)
         return image, label
 
@@ -1005,6 +1005,7 @@ def get_data_generator(
     train_fraction: float = 1.0,
     seed: int | None = None,
     aug_config: AugmentationConfig | None = None,
+    backbone_name: str = "ResNet152",
 ) -> tf.data.Dataset:
     """Crea un generador de datos optimizado en base a un DataFrame de metadatos.
 
@@ -1050,20 +1051,6 @@ def get_data_generator(
     Returns:
         tf.data.Dataset: Dataset de TensorFlow listo para entrenamiento o evaluación.
     """
-    # Aplicar fracción de entrenamiento (muestreo estratificado por semilla)
-    if train_fraction < 1.0:
-        df = df.sample(frac=train_fraction, random_state=seed).reset_index(drop=True)
-
-    # Determinar columna de rutas
-    if "Absolute Path" in df.columns:
-        paths = df["Absolute Path"].astype(str).tolist()
-    elif dataset_path is not None:
-        paths = [str(Path(dataset_path) / p) for p in df["Image Path"]]
-    else:
-        raise ValueError(
-            "El DataFrame debe contener 'Absolute Path' o se debe proveer dataset_path."
-        )
-
     # Determinar columna de etiquetas según el nivel taxonómico
     level = level.lower()
     if level == "fine":
@@ -1075,13 +1062,43 @@ def get_data_generator(
     else:
         raise ValueError("level debe ser uno de: 'macro', 'coarse' o 'fine'.")
 
+    # Aplicar fracción de entrenamiento (muestreo estratificado por semilla)
+    if train_fraction < 1.0:
+        df, _ = train_test_split(
+            df,
+            train_size=train_fraction,
+            stratify=df[label_col],
+            random_state=seed,
+        )
+        df = df.reset_index(drop=True)
+
+    # Determinar columna de rutas
+    if "Absolute Path" in df.columns:
+        paths = df["Absolute Path"].astype(str).tolist()
+    elif dataset_path is not None:
+        paths = [str(Path(dataset_path) / p) for p in df["Image Path"]]
+    else:
+        raise ValueError(
+            "El DataFrame debe contener 'Absolute Path' o se debe proveer dataset_path."
+        )
+
     labels = df[label_col].astype(np.int32).tolist()
+
+    # Seleccionar preprocesamiento según el backbone
+    if backbone_name == "ResNet152":
+        from tensorflow.keras.applications.resnet import preprocess_input
+    elif backbone_name == "MobileNetV3Large":
+        from tensorflow.keras.applications.mobilenet_v3 import preprocess_input
+    elif backbone_name == "EfficientNetV2S":
+        from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+    else:
+        raise ValueError(f"Backbone no soportado: {backbone_name}")
 
     # Crear dataset de base
     dataset = tf.data.Dataset.from_tensor_slices((paths, labels))
 
     if shuffle:
-        dataset = dataset.shuffle(buffer_size=len(paths), seed=seed)
+        dataset = dataset.shuffle(buffer_size=min(10000, len(paths)), seed=seed)
 
     # --- Paso 1: Cargar y redimensionar sin normalizar (valores en [0, 255]) ---
     def _load_and_resize(path: tf.Tensor, label: tf.Tensor):
@@ -1187,9 +1204,10 @@ def build_model(
     num_classes: int,
     input_shape: tuple[int, int, int] = (224, 224, 3),
     learning_rate: float = 1e-4,
-    fine_tune_at: int | None = None,
+    fine_tune_at: str | int | None = None,
     optimizer_name: str = "adamw",
     weight_decay: float = 1e-4,
+    backbone_name: str = "ResNet152",
 ) -> keras.Model:
     """Construye y compila un modelo de red neuronal convolucional basado en ResNet152.
 
@@ -1226,11 +1244,26 @@ def build_model(
         keras.Model: Modelo de Keras compilado y listo para entrenar.
     """
     # Cargar el extractor de características preentrenado sin la cabeza de clasificación
-    base_model = keras.applications.ResNet152(
-        weights="imagenet",
-        include_top=False,
-        input_shape=input_shape,
-    )
+    if backbone_name == "ResNet152":
+        base_model = keras.applications.ResNet152(
+            weights="imagenet",
+            include_top=False,
+            input_shape=input_shape,
+        )
+    elif backbone_name == "MobileNetV3Large":
+        base_model = keras.applications.MobileNetV3Large(
+            weights="imagenet",
+            include_top=False,
+            input_shape=input_shape,
+        )
+    elif backbone_name == "EfficientNetV2S":
+        base_model = keras.applications.EfficientNetV2S(
+            weights="imagenet",
+            include_top=False,
+            input_shape=input_shape,
+        )
+    else:
+        raise ValueError(f"Backbone no soportado: {backbone_name}")
 
     if fine_tune_at is None:
         # Transferencia de aprendizaje básica: congelar todo el extractor
@@ -1238,15 +1271,30 @@ def build_model(
     else:
         # Ajuste fino: descongelar capas superiores a partir de fine_tune_at
         base_model.trainable = True
-        for layer in base_model.layers[:fine_tune_at]:
+        
+        # Si se recibe un string, buscar la capa por nombre y obtener su índice
+        if isinstance(fine_tune_at, str):
+            layer_index = None
+            for idx, layer in enumerate(base_model.layers):
+                if layer.name == fine_tune_at:
+                    layer_index = idx
+                    break
+            if layer_index is None:
+                raise ValueError(f"La capa '{fine_tune_at}' no se encontró en el backbone.")
+            fine_tune_at_idx = layer_index
+        else:
+            fine_tune_at_idx = fine_tune_at
+
+        for layer in base_model.layers[:fine_tune_at_idx]:
             layer.trainable = False
 
     # Definir la arquitectura usando la API funcional de Keras
     inputs = keras.Input(shape=input_shape)
 
     # training=False: BN usa estadísticas móviles de ImageNet (extracción de features).
-    # training=True:  BN actualiza sus estadísticas durante el ajuste fino (fine-tuning).
-    bn_training_mode = fine_tune_at is not None
+    # Como se solicitó, mantenemos training=False incluso durante el fine-tuning
+    # para que BatchNormalization no actualice sus estadísticas móviles (buenas prácticas).
+    bn_training_mode = False
     x = base_model(inputs, training=bn_training_mode)
 
     x = layers.GlobalAveragePooling2D()(x)
@@ -1374,17 +1422,13 @@ def evaluate_model(
     Returns:
         dict: Diccionario que contiene las métricas calculadas y los vectores y_true e y_pred.
     """
-    y_true = []
-    y_pred = []
-
-    # Iterar sobre el dataset para extraer predicciones y etiquetas reales de forma alinedad
-    for images, labels in test_dataset:
-        preds = model.predict(images, verbose=0)
-        y_true.extend(labels.numpy())
-        y_pred.extend(np.argmax(preds, axis=1))
-
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
+    y_pred_probs = model.predict(test_dataset, verbose=0)
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    
+    y_true = np.concatenate([labels.numpy() for _, labels in test_dataset], axis=0)
+    
+    if len(y_pred) != len(y_true):
+        raise ValueError(f"Mismatch in evaluation counts: {len(y_pred)} vs {len(y_true)}. Check shuffle=False in test_dataset.")
 
     # Calcular métricas globales
     accuracy = accuracy_score(y_true, y_pred)
@@ -1397,6 +1441,11 @@ def evaluate_model(
         )
     )
 
+    try:
+        auc = roc_auc_score(y_true, y_pred_probs, multi_class="ovr", average="macro")
+    except ValueError:
+        auc = float('nan')
+
     metrics = {
         "Accuracy": accuracy,
         "Precision (Macro)": precision_macro,
@@ -1405,8 +1454,10 @@ def evaluate_model(
         "Precision (Weighted)": precision_weighted,
         "Recall (Weighted)": recall_weighted,
         "F1-Score (Weighted)": f1_weighted,
+        "AUC (Macro)": auc,
         "y_true": y_true,
         "y_pred": y_pred,
+        "y_pred_probs": y_pred_probs,
     }
 
     return metrics
@@ -1465,6 +1516,55 @@ def plot_training_history(
         plt.savefig(save_path, bbox_inches="tight")
         print(f"Gráfico de historial guardado en: {save_path}")
 
+    plt.show()
+
+
+def plot_roc_curve(
+    y_true: np.ndarray,
+    y_pred_probs: np.ndarray,
+    class_names: list[str],
+    save_path: str | Path | None = None,
+) -> None:
+    """Calcula y grafica la curva ROC (One-vs-Rest) para las clases del dataset.
+
+    Args:
+        y_true (np.ndarray): Etiquetas reales.
+        y_pred_probs (np.ndarray): Probabilidades predichas por el modelo.
+        class_names (list[str]): Nombres de las clases.
+        save_path (str | Path, optional): Ruta donde guardar el gráfico.
+    """
+    from sklearn.metrics import roc_curve, auc
+    from sklearn.preprocessing import label_binarize
+
+    _apply_plot_style()
+    num_classes = len(class_names)
+    y_true_bin = label_binarize(y_true, classes=range(num_classes))
+    
+    if y_true_bin.shape[1] == 1:
+        # Binario
+        y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
+
+    plt.figure(figsize=(10, 8))
+
+    for i in range(num_classes):
+        fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_pred_probs[:, i])
+        roc_auc = auc(fpr, tpr)
+        plt.plot(fpr, tpr, lw=2, label=f'{class_names[i]} (AUC = {roc_auc:.2f})')
+
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Tasa de Falsos Positivos')
+    plt.ylabel('Tasa de Verdaderos Positivos')
+    plt.title('Curva ROC Multi-clase (One-vs-Rest)')
+    # Para muchas clases, la leyenda puede ser grande. Ocultarla o colocarla afuera si es muy larga.
+    if num_classes <= 20:
+        plt.legend(loc="lower right", fontsize=8)
+    
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, bbox_inches="tight")
+        print(f"Curva ROC guardada en: {save_path}")
     plt.show()
 
 
@@ -1684,129 +1784,3 @@ def print_kfold_report(
             print(f"  Media : {mean:.4f}")
             print(f"  Desv. : {std:.4f}")
 
-
-# ---------------------------------------------------------------------------
-# Preparación de modelos para análisis XAI (Grad-CAM y SHAP)
-# ---------------------------------------------------------------------------
-
-def get_gradcam_model(
-    model: keras.Model,
-    last_conv_layer_name: str = "conv5_block3_out",
-) -> keras.Model:
-    """Construye un sub-modelo con dos salidas para el análisis Grad-CAM.
-
-    Expone simultáneamente el mapa de activación de la última capa convolucional
-    y las probabilidades de la capa de salida, que son los dos tensores necesarios
-    para calcular los mapas de saliencia Grad-CAM mediante ``GradientTape``.
-
-    Uso típico::
-
-        grad_model = get_gradcam_model(model)
-
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array)
-            class_score = predictions[:, target_class]
-
-        grads = tape.gradient(class_score, conv_outputs)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        heatmap = conv_outputs[0] @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
-
-    Args:
-        model (keras.Model): Modelo ResNet152 compilado, tal como lo construye
-            ``build_model``.
-        last_conv_layer_name (str, optional): Nombre de la última capa convolucional
-            del extractor de características de ResNet152. Por defecto es
-            'conv5_block3_out', que corresponde a la última capa residual de
-            ResNet152.
-
-    Returns:
-        keras.Model: Sub-modelo de Keras con dos salidas:
-            - ``outputs[0]``: Tensor BxHxWxC del mapa de activación de la capa
-              convolucional indicada.
-            - ``outputs[1]``: Tensor BxN de probabilidades de la capa Softmax.
-
-    Raises:
-        ValueError: Si la capa ``last_conv_layer_name`` no existe en el modelo.
-    """
-    # Localizar la capa convolucional dentro del extractor base (sub-modelo)
-    base_model = None
-    for layer in model.layers:
-        if isinstance(layer, keras.Model):
-            base_model = layer
-            break
-
-    if base_model is None:
-        raise ValueError(
-            "No se encontró un sub-modelo base en el modelo proporcionado."
-        )
-
-    try:
-        conv_layer = base_model.get_layer(last_conv_layer_name)
-    except ValueError:
-        raise ValueError(
-            f"La capa '{last_conv_layer_name}' no existe en el extractor base. "
-            "Verifique el nombre con model.layers[i].name."
-        )
-
-    # Construir el sub-modelo que expone el mapa de activación y la salida final
-    grad_model = keras.Model(
-        inputs=model.inputs,
-        outputs=[conv_layer.output, model.output],
-    )
-
-    return grad_model
-
-
-def get_feature_extractor(
-    model: keras.Model,
-    pooling_layer_name: str = "global_average_pooling2d",
-) -> keras.Model:
-    """Construye un sub-modelo que produce el vector de características comprimido.
-
-    Retorna la representación vectorial del espacio de características (salida del
-    ``GlobalAveragePooling2D``) sin pasar por la capa de clasificación. Este vector
-    es el input natural para explicadores basados en SHAP (``DeepExplainer`` o
-    ``GradientExplainer``).
-
-    Uso típico::
-
-        feature_extractor = get_feature_extractor(model)
-
-        # Extraer representaciones del conjunto de fondo (background)
-        background_features = feature_extractor(background_images)
-
-        # Crear el explicador SHAP
-        explainer = shap.GradientExplainer(feature_extractor, background_images)
-        shap_values = explainer.shap_values(test_images)
-
-    Args:
-        model (keras.Model): Modelo ResNet152 compilado, tal como lo construye
-            ``build_model``.
-        pooling_layer_name (str, optional): Nombre de la capa de pooling que
-            produce el vector de características. Por defecto es
-            'global_average_pooling2d'.
-
-    Returns:
-        keras.Model: Sub-modelo de Keras cuya salida es el vector de características
-            de dimensión (batch_size, 2048) correspondiente a la representación
-            interna de ResNet152 después del pooling global.
-
-    Raises:
-        ValueError: Si la capa ``pooling_layer_name`` no existe en el modelo.
-    """
-    try:
-        pooling_layer = model.get_layer(pooling_layer_name)
-    except ValueError:
-        raise ValueError(
-            f"La capa '{pooling_layer_name}' no existe en el modelo. "
-            "Verifique el nombre con model.layers[i].name."
-        )
-
-    feature_extractor = keras.Model(
-        inputs=model.inputs,
-        outputs=pooling_layer.output,
-    )
-
-    return feature_extractor
