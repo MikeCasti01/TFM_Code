@@ -15,6 +15,7 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.applications.resnet import preprocess_input
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.model_selection import StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 
 
@@ -159,10 +160,20 @@ class AugmentationConfig:
     gaussian_noise: bool = False
     noise_std_limit: float = 0.05
 
-    # --- Oclusión ---
+    # --- Borrado aleatorio ---
     random_erasing: bool = False
     erasing_scale: tuple = (0.02, 0.2)
     erasing_ratio: tuple = (0.3, 3.3)
+
+    # --- Estrategia de grupos ---
+    use_group_strategy: bool = False
+    """Cuando es True, por cada imagen se selecciona aleatoriamente uno de los
+    4 grupos de augmentación (geométrico, fotométrico, desenfoque/ruido,
+    borrado aleatorio) y solo se aplican las operaciones de ese grupo.
+    Cuando es False (por defecto) se aplican todas las operaciones habilitadas
+    de forma independiente, preservando el comportamiento original."""
+    # Nota: los docstrings de campos en dataclasses se documentan arriba en el
+    # docstring de clase; este comentario sirve de referencia inline.
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +643,180 @@ def _apply_numpy_augmentations(
 # Aumento de datos
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Funciones auxiliares privadas — Estrategia de grupos de augmentación
+# ---------------------------------------------------------------------------
+
+def _augment_group_geometrico(
+    image: tf.Tensor,
+    config: AugmentationConfig,
+) -> tf.Tensor:
+    """Aplica el grupo de transformaciones geométricas habilitadas en ``config``.
+
+    Transformaciones incluidas: volteo horizontal, recorte aleatorio
+    redimensionado, rotación, escalado, perspectiva y traslación.
+
+    Args:
+        image (tf.Tensor): Tensor HxWxC float32 con valores en [0, 255].
+        config (AugmentationConfig): Configuración de augmentaciones.
+
+    Returns:
+        tf.Tensor: Tensor HxWxC float32 con transformaciones geométricas aplicadas.
+    """
+    if config.horizontal_flip:
+        image = tf.image.random_flip_left_right(image)
+    if config.random_resized_crop:
+        image = _tf_random_resized_crop(image, config.rrc_scale, config.rrc_ratio)
+
+    original_shape = image.shape
+
+    def _geom_numpy(img_tensor: tf.Tensor) -> np.ndarray:
+        img = img_tensor.numpy()
+        if config.rotation:
+            img = _np_rotation(img, config.rotation_max_degrees)
+        if config.scaling:
+            img = _np_scaling(img, config.scale_factor)
+        if config.perspective:
+            img = _np_perspective(
+                img, config.perspective_scale_min, config.perspective_scale_max
+            )
+        if config.translation:
+            img = _np_translation(
+                img, config.translate_x_max_pct, config.translate_y_max_pct
+            )
+        return img.astype(np.float32)
+
+    numpy_needed = any([
+        config.rotation, config.scaling, config.perspective, config.translation
+    ])
+    if numpy_needed:
+        image = tf.py_function(_geom_numpy, [image], tf.float32)
+        image.set_shape(original_shape)
+    return image
+
+
+def _augment_group_fotometrico(
+    image: tf.Tensor,
+    config: AugmentationConfig,
+) -> tf.Tensor:
+    """Aplica el grupo de transformaciones fotométricas habilitadas en ``config``.
+
+    Transformaciones incluidas: brillo, contraste, corrección gamma y
+    ajuste de matiz/saturación.
+
+    Args:
+        image (tf.Tensor): Tensor HxWxC float32 con valores en [0, 255].
+        config (AugmentationConfig): Configuración de augmentaciones.
+
+    Returns:
+        tf.Tensor: Tensor HxWxC float32 con transformaciones fotométricas aplicadas.
+    """
+    if config.brightness:
+        max_delta = config.brightness_limit * 255.0
+        image = tf.image.random_brightness(image, max_delta=max_delta)
+        image = tf.clip_by_value(image, 0.0, 255.0)
+    if config.contrast:
+        lower = max(0.0, 1.0 - config.contrast_limit)
+        upper = 1.0 + config.contrast_limit
+        image = tf.image.random_contrast(image, lower=lower, upper=upper)
+        image = tf.clip_by_value(image, 0.0, 255.0)
+
+    original_shape = image.shape
+
+    def _photo_numpy(img_tensor: tf.Tensor) -> np.ndarray:
+        img = img_tensor.numpy()
+        if config.gamma:
+            img = _np_gamma(img, config.gamma_limit)
+        if config.hue_saturation:
+            img = _np_hue_saturation(
+                img, config.hue_shift_limit, config.sat_shift_limit
+            )
+        return img.astype(np.float32)
+
+    numpy_needed = any([config.gamma, config.hue_saturation])
+    if numpy_needed:
+        image = tf.py_function(_photo_numpy, [image], tf.float32)
+        image.set_shape(original_shape)
+    return image
+
+
+def _augment_group_desenfoque_ruido(
+    image: tf.Tensor,
+    config: AugmentationConfig,
+) -> tf.Tensor:
+    """Aplica el grupo de desenfoque y ruido habilitado en ``config``.
+
+    Transformaciones incluidas: desenfoque gaussiano, desenfoque de movimiento
+    y ruido gaussiano aditivo.
+
+    Args:
+        image (tf.Tensor): Tensor HxWxC float32 con valores en [0, 255].
+        config (AugmentationConfig): Configuración de augmentaciones.
+
+    Returns:
+        tf.Tensor: Tensor HxWxC float32 con desenfoque y/o ruido aplicados.
+    """
+    original_shape = image.shape
+
+    def _noise_numpy(img_tensor: tf.Tensor) -> np.ndarray:
+        img = img_tensor.numpy()
+        if config.gaussian_blur:
+            img = _np_gaussian_blur(img, config.blur_limit)
+        if config.motion_blur:
+            img = _np_motion_blur(img, config.motion_blur_limit)
+        if config.gaussian_noise:
+            img = _np_gaussian_noise(img, config.noise_std_limit)
+        return img.astype(np.float32)
+
+    numpy_needed = any([
+        config.gaussian_blur, config.motion_blur, config.gaussian_noise
+    ])
+    if numpy_needed:
+        image = tf.py_function(_noise_numpy, [image], tf.float32)
+        image.set_shape(original_shape)
+    return image
+
+
+def _augment_group_borrado(
+    image: tf.Tensor,
+    config: AugmentationConfig,
+) -> tf.Tensor:
+    """Aplica el grupo de borrado aleatorio habilitado en ``config``.
+
+    Transforma la imagen borrando aleatoriamente una región rectangular.
+
+    Args:
+        image (tf.Tensor): Tensor HxWxC float32 con valores en [0, 255].
+        config (AugmentationConfig): Configuración de augmentaciones.
+
+    Returns:
+        tf.Tensor: Tensor HxWxC float32 con la región borrada (o sin cambios
+        si ``random_erasing`` está desactivado).
+    """
+    if not config.random_erasing:
+        return image
+
+    original_shape = image.shape
+
+    def _erase_numpy(img_tensor: tf.Tensor) -> np.ndarray:
+        img = img_tensor.numpy()
+        img = _np_random_erasing(img, config.erasing_scale, config.erasing_ratio)
+        return img.astype(np.float32)
+
+    image = tf.py_function(_erase_numpy, [image], tf.float32)
+    image.set_shape(original_shape)
+    return image
+
+
+# Tabla de funciones de grupo indexada para selección aleatoria
+_GROUP_FUNCTIONS = [
+    _augment_group_geometrico,
+    _augment_group_fotometrico,
+    _augment_group_desenfoque_ruido,
+    _augment_group_borrado,
+]
+
+
 def augment_image(
     image: tf.Tensor,
     label: int,
@@ -639,12 +824,12 @@ def augment_image(
 ) -> tuple[tf.Tensor, int]:
     """Aplica aumento de datos configurable a una imagen en escala [0, 255].
 
-    Combina operaciones nativas de TensorFlow con operaciones NumPy/OpenCV
-    encapsuladas en ``tf.py_function``. Las augmentaciones geométricas se aplican
-    primero, seguidas de las fotométricas y finalmente las de desenfoque, ruido
-    y borrado.
+    Soporta dos modos de operación controlados por ``config.use_group_strategy``:
 
-    El orden de aplicación de las augmentaciones es el siguiente:
+    **Modo clásico** (``use_group_strategy=False``, comportamiento por defecto):
+    Combina operaciones nativas de TensorFlow con operaciones NumPy/OpenCV
+    encapsuladas en ``tf.py_function``. Las augmentaciones se aplican de forma
+    acumulativa en el orden siguiente:
 
         1.  Volteo Horizontal (TF-native, p=0.5)
         2.  Recorte Aleatorio Redimensionado (TF-native)
@@ -661,6 +846,19 @@ def augment_image(
         13. Ruido Gaussiano (NumPy)
         14. Borrado Aleatorio (NumPy)
 
+    **Modo por grupos** (``use_group_strategy=True``):
+    Por cada imagen se selecciona aleatoriamente uno de los 4 grupos de
+    augmentación y se aplican únicamente las operaciones de ese grupo:
+
+        - Grupo 0 — Transformaciones geométricas
+        - Grupo 1 — Transformaciones fotométricas
+        - Grupo 2 — Desenfoque y ruido
+        - Grupo 3 — Borrado aleatorio
+
+    Cada grupo respeta los flags individuales del ``AugmentationConfig``, de modo
+    que si una operación está desactivada dentro del grupo seleccionado, no se
+    aplica. La semilla global controla la selección del grupo.
+
     Args:
         image (tf.Tensor): Tensor HxWxC float32 con valores en [0, 255].
         label (int): Identificador numérico de la clase (sin modificar).
@@ -672,6 +870,14 @@ def augment_image(
     """
     if config is None:
         config = AugmentationConfig()
+
+    if config.use_group_strategy:
+        # Seleccionar un grupo de forma aleatoria y aplicar solo ese grupo
+        group_idx = random.randint(0, len(_GROUP_FUNCTIONS) - 1)
+        image = _GROUP_FUNCTIONS[group_idx](image, config)
+        return image, label
+
+    # --- Modo clásico: aplicar todas las augmentaciones habilitadas ---
 
     # --- 1. Volteo Horizontal (TF-native, p=0.5) ---
     if config.horizontal_flip:
@@ -992,19 +1198,29 @@ def build_model(
     hasta una capa determinada para ajuste fino (fine-tuning). Añade una cabeza de
     clasificación personalizada con Regularización Dropout y una capa Softmax final.
 
+    Comportamiento de BatchNormalization:
+        - Si ``fine_tune_at`` es None (extracción de características): el extractor
+          se ejecuta con ``training=False``, de modo que las capas BN usan sus
+          estadísticas móviles de ImageNet y no se corrompen durante el entrenamiento
+          de la cabeza.
+        - Si ``fine_tune_at`` es un entero (ajuste fino): el extractor se ejecuta
+          con ``training=True``, permitiendo que las capas BN descongeladas
+          actualicen correctamente sus estadísticas móviles durante el fine-tuning.
+
     Args:
         num_classes (int): Cantidad de clases en la capa de salida.
         input_shape (tuple[int, int, int], optional): Dimensiones de entrada (alto, ancho, canales).
             Por defecto es (224, 224, 3).
-        learning_rate (float, optional): Tasa de aprendizaje inicial para el optimizador AdamW.
+        learning_rate (float, optional): Tasa de aprendizaje inicial para el optimizador.
             Por defecto es 1e-4.
         fine_tune_at (int, optional): Índice de capa a partir del cual se descongelarán
             las capas del extractor de características para el ajuste fino.
-            Si es None, se congela por completo el extractor.
-        optimizer_name (str, optional): Nombre del optimizador a usar. 
+            Si es None, se congela por completo el extractor y se usa ``training=False``
+            en el extractor. Si se especifica un entero, se usa ``training=True``.
+        optimizer_name (str, optional): Nombre del optimizador a usar.
             'adamw', o 'adam'.
         weight_decay (float, optional): Tasa de decaimiento de peso para optimizadores
-            que lo soportan (AdamW, SGD). Por defecto es 1e-4.
+            que lo soportan (AdamW). Por defecto es 1e-4.
 
     Returns:
         keras.Model: Modelo de Keras compilado y listo para entrenar.
@@ -1028,9 +1244,11 @@ def build_model(
     # Definir la arquitectura usando la API funcional de Keras
     inputs = keras.Input(shape=input_shape)
 
-    # Importante: training=False asegura que las capas de BatchNormalization corran
-    # en modo de inferencia y no destruyan los pesos aprendidos de ImageNet
-    x = base_model(inputs, training=False)
+    # training=False: BN usa estadísticas móviles de ImageNet (extracción de features).
+    # training=True:  BN actualiza sus estadísticas durante el ajuste fino (fine-tuning).
+    bn_training_mode = fine_tune_at is not None
+    x = base_model(inputs, training=bn_training_mode)
+
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
@@ -1077,16 +1295,29 @@ def train_model(
     epochs: int = 20,
     callbacks: list | None = None,
     class_weight: dict[int, float] | None = None,
+    initial_epoch: int = 0,
 ) -> keras.callbacks.History:
     """Entrena el modelo utilizando los datasets proporcionados y callbacks configurados.
+
+    Diseñado para ser agnóstico a la etapa de entrenamiento: puede usarse tanto
+    para la Etapa 1 (cabeza de clasificación) como para la Etapa 2 (ajuste fino)
+    sin ninguna lógica interna específica. El notebook es responsable de orquestar
+    las etapas, recompilar el modelo con la tasa de aprendizaje correcta y
+    proporcionar los callbacks adecuados para cada etapa.
 
     Args:
         model (keras.Model): Modelo compilado de Keras.
         train_dataset (tf.data.Dataset): Dataset para el entrenamiento.
         val_dataset (tf.data.Dataset): Dataset para la validación durante el entrenamiento.
-        epochs (int, optional): Número máximo de épocas. Por defecto es 20.
+        epochs (int, optional): Número máximo de épocas totales. Por defecto es 20.
         callbacks (list, optional): Lista de callbacks personalizados de Keras. Si es None,
             se configuran callbacks por defecto (EarlyStopping y ReduceLROnPlateau).
+        class_weight (dict[int, float], optional): Diccionario de pesos por clase para
+            compensar el desbalanceo. Si es None, no se aplica ponderación.
+        initial_epoch (int, optional): Época desde la que se comienza el entrenamiento.
+            Útil para continuar el historial entre etapas (p. ej., Stage 2 comienza
+            desde ``STAGE1_EPOCHS`` para mantener el historial acumulado).
+            Por defecto es 0.
 
     Returns:
         keras.callbacks.History: Historial del entrenamiento con las pérdidas y métricas.
@@ -1112,6 +1343,7 @@ def train_model(
         train_dataset,
         validation_data=val_dataset,
         epochs=epochs,
+        initial_epoch=initial_epoch,
         callbacks=callbacks,
         class_weight=class_weight,
     )
@@ -1305,3 +1537,276 @@ def plot_confusion_matrix(
         print(f"Matriz de confusión guardada en: {save_path}")
 
     plt.show()
+
+
+# ---------------------------------------------------------------------------
+# Validación cruzada K-Fold estratificada
+# ---------------------------------------------------------------------------
+
+def compute_kfold_splits(
+    df: pd.DataFrame,
+    level: str = "fine",
+    n_splits: int = 5,
+    seed: int | None = None,
+) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
+    """Genera los índices de entrenamiento y validación para K-Fold estratificado.
+
+    Utiliza ``StratifiedKFold`` para dividir el DataFrame en ``n_splits`` pliegues
+    (folds) conservando las proporciones de clase de cada split. Cada fold produce
+    un subconjunto de entrenamiento y uno de validación completamente independientes.
+
+    Args:
+        df (pd.DataFrame): DataFrame con los metadatos de las imágenes. Debe
+            contener la columna de etiquetas correspondiente al nivel taxonómico
+            indicado ('Fine ID', 'Coarse ID' o 'Macro ID').
+        level (str, optional): Nivel taxonómico de clasificación. Acepta
+            'macro', 'coarse' o 'fine'. Por defecto es 'fine'.
+        n_splits (int, optional): Número de pliegues. Por defecto es 5.
+        seed (int, optional): Semilla aleatoria para garantizar la reproducibilidad
+            de la partición. Por defecto es None.
+
+    Returns:
+        list[tuple[pd.DataFrame, pd.DataFrame]]: Lista de ``n_splits`` tuplas.
+            Cada tupla contiene ``(train_df, val_df)`` con los metadatos
+            correspondientes a ese pliegue, reiniciando el índice.
+
+    Raises:
+        ValueError: Si ``level`` no es uno de 'macro', 'coarse' o 'fine'.
+    """
+    level = level.lower()
+    label_columns = {"macro": "Macro ID", "coarse": "Coarse ID", "fine": "Fine ID"}
+
+    if level not in label_columns:
+        raise ValueError("level debe ser uno de: 'macro', 'coarse' o 'fine'.")
+
+    label_col = label_columns[level]
+    labels = df[label_col].astype(np.int32).values
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    splits = []
+
+    for train_idx, val_idx in skf.split(np.zeros(len(labels)), labels):
+        train_df = df.iloc[train_idx].reset_index(drop=True)
+        val_df = df.iloc[val_idx].reset_index(drop=True)
+        splits.append((train_df, val_df))
+
+    return splits
+
+
+def aggregate_kfold_metrics(
+    fold_metrics: list[dict],
+) -> dict[str, dict[str, float]]:
+    """Agrega las métricas de todos los pliegues calculando media y desviación estándar.
+
+    Itera sobre la lista de diccionarios de métricas producidos por ``evaluate_model``
+    (uno por pliegue) y calcula la media y la desviación estándar de cada métrica
+    escalar. Los campos no escalares (p. ej., 'y_true', 'y_pred') se ignoran.
+
+    Args:
+        fold_metrics (list[dict]): Lista de diccionarios de métricas, uno por pliegue.
+            Cada diccionario debe contener claves escalares con valores float
+            compatibles con NumPy.
+
+    Returns:
+        dict[str, dict[str, float]]: Diccionario anidado con la siguiente estructura::
+
+            {
+                "Accuracy": {"mean": 0.92, "std": 0.01},
+                "F1-Score (Macro)": {"mean": 0.90, "std": 0.02},
+                ...
+            }
+    """
+    # Identificar claves escalares (excluir arrays como y_true/y_pred)
+    scalar_keys = [
+        k for k, v in fold_metrics[0].items()
+        if not isinstance(v, np.ndarray)
+    ]
+
+    aggregated: dict[str, dict[str, float]] = {}
+
+    for key in scalar_keys:
+        values = np.array([m[key] for m in fold_metrics], dtype=np.float64)
+        aggregated[key] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+        }
+
+    return aggregated
+
+
+def print_kfold_report(
+    fold_metrics: list[dict],
+    aggregated: dict[str, dict[str, float]],
+) -> None:
+    """Imprime un reporte formateado con los resultados de la validación cruzada.
+
+    Muestra las métricas de cada pliegue individualmente y, al final, el resumen
+    estadístico (media ± desviación estándar) para las métricas principales.
+
+    Args:
+        fold_metrics (list[dict]): Lista de diccionarios de métricas por pliegue,
+            tal como devuelve ``evaluate_model``.
+        aggregated (dict[str, dict[str, float]]): Diccionario de métricas agregadas,
+            tal como devuelve ``aggregate_kfold_metrics``.
+    """
+    # Métricas principales a mostrar en el resumen final
+    summary_keys = [
+        "Accuracy",
+        "Precision (Macro)",
+        "Recall (Macro)",
+        "F1-Score (Macro)",
+        "Precision (Weighted)",
+        "Recall (Weighted)",
+        "F1-Score (Weighted)",
+    ]
+
+    # Imprimir resultados por pliegue
+    for fold_idx, metrics in enumerate(fold_metrics, start=1):
+        print(f"\nFold {fold_idx}")
+        print(f"  Accuracy             : {metrics.get('Accuracy', float('nan')):.4f}")
+        print(f"  Precision (Macro)    : {metrics.get('Precision (Macro)', float('nan')):.4f}")
+        print(f"  Recall (Macro)       : {metrics.get('Recall (Macro)', float('nan')):.4f}")
+        print(f"  F1-Score (Macro)     : {metrics.get('F1-Score (Macro)', float('nan')):.4f}")
+        print(f"  Precision (Weighted) : {metrics.get('Precision (Weighted)', float('nan')):.4f}")
+        print(f"  Recall (Weighted)    : {metrics.get('Recall (Weighted)', float('nan')):.4f}")
+        print(f"  F1-Score (Weighted)  : {metrics.get('F1-Score (Weighted)', float('nan')):.4f}")
+
+    # Imprimir resumen de validación cruzada
+    print("\n" + "=" * 56)
+    print("Resultados de Validación Cruzada")
+    print("=" * 56)
+
+    for key in summary_keys:
+        if key in aggregated:
+            mean = aggregated[key]["mean"]
+            std = aggregated[key]["std"]
+            print(f"\n{key}")
+            print(f"  Media : {mean:.4f}")
+            print(f"  Desv. : {std:.4f}")
+
+
+# ---------------------------------------------------------------------------
+# Preparación de modelos para análisis XAI (Grad-CAM y SHAP)
+# ---------------------------------------------------------------------------
+
+def get_gradcam_model(
+    model: keras.Model,
+    last_conv_layer_name: str = "conv5_block3_out",
+) -> keras.Model:
+    """Construye un sub-modelo con dos salidas para el análisis Grad-CAM.
+
+    Expone simultáneamente el mapa de activación de la última capa convolucional
+    y las probabilidades de la capa de salida, que son los dos tensores necesarios
+    para calcular los mapas de saliencia Grad-CAM mediante ``GradientTape``.
+
+    Uso típico::
+
+        grad_model = get_gradcam_model(model)
+
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = grad_model(img_array)
+            class_score = predictions[:, target_class]
+
+        grads = tape.gradient(class_score, conv_outputs)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        heatmap = conv_outputs[0] @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+
+    Args:
+        model (keras.Model): Modelo ResNet152 compilado, tal como lo construye
+            ``build_model``.
+        last_conv_layer_name (str, optional): Nombre de la última capa convolucional
+            del extractor de características de ResNet152. Por defecto es
+            'conv5_block3_out', que corresponde a la última capa residual de
+            ResNet152.
+
+    Returns:
+        keras.Model: Sub-modelo de Keras con dos salidas:
+            - ``outputs[0]``: Tensor BxHxWxC del mapa de activación de la capa
+              convolucional indicada.
+            - ``outputs[1]``: Tensor BxN de probabilidades de la capa Softmax.
+
+    Raises:
+        ValueError: Si la capa ``last_conv_layer_name`` no existe en el modelo.
+    """
+    # Localizar la capa convolucional dentro del extractor base (sub-modelo)
+    base_model = None
+    for layer in model.layers:
+        if isinstance(layer, keras.Model):
+            base_model = layer
+            break
+
+    if base_model is None:
+        raise ValueError(
+            "No se encontró un sub-modelo base en el modelo proporcionado."
+        )
+
+    try:
+        conv_layer = base_model.get_layer(last_conv_layer_name)
+    except ValueError:
+        raise ValueError(
+            f"La capa '{last_conv_layer_name}' no existe en el extractor base. "
+            "Verifique el nombre con model.layers[i].name."
+        )
+
+    # Construir el sub-modelo que expone el mapa de activación y la salida final
+    grad_model = keras.Model(
+        inputs=model.inputs,
+        outputs=[conv_layer.output, model.output],
+    )
+
+    return grad_model
+
+
+def get_feature_extractor(
+    model: keras.Model,
+    pooling_layer_name: str = "global_average_pooling2d",
+) -> keras.Model:
+    """Construye un sub-modelo que produce el vector de características comprimido.
+
+    Retorna la representación vectorial del espacio de características (salida del
+    ``GlobalAveragePooling2D``) sin pasar por la capa de clasificación. Este vector
+    es el input natural para explicadores basados en SHAP (``DeepExplainer`` o
+    ``GradientExplainer``).
+
+    Uso típico::
+
+        feature_extractor = get_feature_extractor(model)
+
+        # Extraer representaciones del conjunto de fondo (background)
+        background_features = feature_extractor(background_images)
+
+        # Crear el explicador SHAP
+        explainer = shap.GradientExplainer(feature_extractor, background_images)
+        shap_values = explainer.shap_values(test_images)
+
+    Args:
+        model (keras.Model): Modelo ResNet152 compilado, tal como lo construye
+            ``build_model``.
+        pooling_layer_name (str, optional): Nombre de la capa de pooling que
+            produce el vector de características. Por defecto es
+            'global_average_pooling2d'.
+
+    Returns:
+        keras.Model: Sub-modelo de Keras cuya salida es el vector de características
+            de dimensión (batch_size, 2048) correspondiente a la representación
+            interna de ResNet152 después del pooling global.
+
+    Raises:
+        ValueError: Si la capa ``pooling_layer_name`` no existe en el modelo.
+    """
+    try:
+        pooling_layer = model.get_layer(pooling_layer_name)
+    except ValueError:
+        raise ValueError(
+            f"La capa '{pooling_layer_name}' no existe en el modelo. "
+            "Verifique el nombre con model.layers[i].name."
+        )
+
+    feature_extractor = keras.Model(
+        inputs=model.inputs,
+        outputs=pooling_layer.output,
+    )
+
+    return feature_extractor
