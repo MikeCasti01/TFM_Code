@@ -196,43 +196,6 @@ def _apply_plot_style() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Carga y preprocesamiento de imágenes
-# ---------------------------------------------------------------------------
-
-def load_and_preprocess_image(
-    image_path: str,
-    label: int,
-    target_size: tuple[int, int] = (224, 224),
-) -> tuple[tf.Tensor, int]:
-    """Carga una imagen desde su ruta, la decodifica, redimensiona y preprocesa.
-
-    Esta función lee la imagen desde el disco en formato JPEG, la decodifica,
-    la escala al tamaño objetivo y aplica el preprocesamiento específico de
-    la arquitectura ResNet (centrado de canales y reordenamiento a BGR).
-
-    Args:
-        image_path (str): Ruta absoluta o relativa al archivo de imagen.
-        label (int): Identificador de la clase asignada.
-        target_size (tuple[int, int], optional): Dimensiones de salida (ancho, alto).
-            Por defecto es (224, 224).
-
-    Returns:
-        tuple[tf.Tensor, int]: Tupla que contiene el tensor de la imagen
-            preprocesada y la etiqueta correspondiente.
-    """
-    # Leer el archivo
-    img_raw = tf.io.read_file(image_path)
-    # Decodificar el archivo como JPEG con 3 canales de color (RGB)
-    img = tf.image.decode_jpeg(img_raw, channels=3)
-    # Redimensionar al tamaño objetivo
-    img = tf.image.resize(img, target_size)
-    # Aplicar preprocesamiento específico de ResNet152 (espera valores de 0 a 255)
-    img = preprocess_input(img)
-
-    return img, label
-
-
-# ---------------------------------------------------------------------------
 # Funciones auxiliares privadas — Augmentaciones NumPy
 # ---------------------------------------------------------------------------
 
@@ -640,10 +603,6 @@ def _apply_numpy_augmentations(
 
 
 # ---------------------------------------------------------------------------
-# Aumento de datos
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Funciones auxiliares privadas — Estrategia de grupos de augmentación
 # ---------------------------------------------------------------------------
 
@@ -806,15 +765,6 @@ def _augment_group_borrado(
     image = tf.py_function(_erase_numpy, [image], tf.float32)
     image.set_shape(original_shape)
     return image
-
-
-# Tabla de funciones de grupo indexada para selección aleatoria
-_GROUP_FUNCTIONS = [
-    _augment_group_geometrico,
-    _augment_group_fotometrico,
-    _augment_group_desenfoque_ruido,
-    _augment_group_borrado,
-]
 
 
 def augment_image(
@@ -1762,6 +1712,7 @@ def print_kfold_report(
         "Precision (Weighted)",
         "Recall (Weighted)",
         "F1-Score (Weighted)",
+        "AUC (Macro)",
     ]
 
     # Imprimir resultados por pliegue
@@ -1788,3 +1739,291 @@ def print_kfold_report(
             print(f"  Media : {mean:.4f}")
             print(f"  Desv. : {std:.4f}")
 
+
+def print_evaluation_report(metrics: dict) -> None:
+    """Imprime un reporte legible con todas las métricas de evaluación del modelo.
+
+    Muestra en consola las métricas escalares retornadas por ``evaluate_model``,
+    incluyendo exactitud, precisión, recall, F1 y AUC macro-OvR. Los arrays no
+    escalares (``y_true``, ``y_pred``, ``y_pred_probs``) se omiten
+    automáticamente. Diseñada para ser invocada tanto en el flujo sin K-Fold como
+    en cualquier flujo de evaluación individual, garantizando que ``AUC (Macro)``
+    siempre forme parte del reporte impreso.
+
+    Args:
+        metrics (dict): Diccionario retornado por :func:`evaluate_model`. Se
+            esperan las claves ``'Accuracy'``, ``'Precision (Macro)'``,
+            ``'Recall (Macro)'``, ``'F1-Score (Macro)'``, ``'Precision (Weighted)'``,
+            ``'Recall (Weighted)'``, ``'F1-Score (Weighted)'`` y ``'AUC (Macro)'``.
+            Las claves ausentes se muestran como ``nan``.
+    """
+    print("\n" + "=" * 56)
+    print("Reporte de Evaluación del Modelo")
+    print("=" * 56)
+    print(f"Exactitud (Accuracy)        : {metrics.get('Accuracy', float('nan')):.4f}")
+    print(f"Precisión (Macro)           : {metrics.get('Precision (Macro)', float('nan')):.4f}")
+    print(f"Sensibilidad/Recall (Macro) : {metrics.get('Recall (Macro)', float('nan')):.4f}")
+    print(f"F1-Score (Macro)            : {metrics.get('F1-Score (Macro)', float('nan')):.4f}")
+    print(f"Precisión (Weighted)        : {metrics.get('Precision (Weighted)', float('nan')):.4f}")
+    print(f"Sensibilidad/Recall (Wgt.)  : {metrics.get('Recall (Weighted)', float('nan')):.4f}")
+    print(f"F1-Score (Weighted)         : {metrics.get('F1-Score (Weighted)', float('nan')):.4f}")
+    print(f"AUC (Macro OvR)             : {metrics.get('AUC (Macro)', float('nan')):.4f}")
+    print("=" * 56)
+
+
+# ---------------------------------------------------------------------------
+# Curvas ROC Globales — Micro-average y Macro-average
+# ---------------------------------------------------------------------------
+
+def plot_roc_micro_average(
+    y_true: np.ndarray,
+    y_pred_probs: np.ndarray,
+    class_names: list[str],
+    save_path: str | Path | None = None,
+    display_plot: bool = True,
+) -> float:
+    """Calcula y grafica la curva ROC micro-average para clasificación multi-clase.
+
+    La estrategia micro-average agrega las contribuciones de todas las clases
+    concatenando los vectores OvR binarios antes de calcular la curva ROC única.
+    Esta representación pondera igualmente cada par (muestra, clase), siendo
+    especialmente útil cuando las clases están desbalanceadas.
+
+    El valor AUC micro-average se incluye en la leyenda de la figura. La figura
+    generada tiene calidad de publicación (DPI 150, ejes etiquetados, cuadrícula
+    sutil).
+
+    Compatibilidad: scikit-learn >= 1.0, Python 3.12, TF 2.20, Keras 3.13.
+
+    Args:
+        y_true (np.ndarray): Array 1-D de etiquetas enteras reales con valores en
+            ``[0, num_classes - 1]``. Shape: ``(n_samples,)``.
+        y_pred_probs (np.ndarray): Matriz de probabilidades predichas por el modelo.
+            Shape: ``(n_samples, num_classes)``.
+        class_names (list[str]): Lista ordenada de nombres de clases. Su longitud
+            determina ``num_classes``.
+        save_path (str | Path, optional): Ruta completa donde se guardará la figura
+            (p. ej. ``CACHE_PATH / 'XAI' / 'roc_micro.png'``). Si es ``None``, la
+            figura no se guarda en disco. Por defecto es ``None``.
+        display_plot (bool, optional): Si es ``True``, llama a ``plt.show()`` para
+            mostrar la figura. Por defecto es ``True``.
+
+    Returns:
+        float: Valor del AUC micro-average.
+
+    Raises:
+        ValueError: Si ``y_pred_probs.shape[1]`` no coincide con ``len(class_names)``.
+    """
+    import logging
+    from sklearn.metrics import roc_curve, auc
+    from sklearn.preprocessing import label_binarize
+
+    logger = logging.getLogger(__name__)
+
+    num_classes = len(class_names)
+    if y_pred_probs.shape[1] != num_classes:
+        raise ValueError(
+            f"y_pred_probs tiene {y_pred_probs.shape[1]} columnas "
+            f"pero class_names tiene {num_classes} elementos."
+        )
+
+    # --- Estilo de publicación (independiente de _apply_plot_style) ---
+    plt.rcParams.update({
+        "figure.dpi": 150,
+        "figure.figsize": (8, 7),
+        "axes.titlesize": 15,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 11,
+        "font.size": 11,
+        "axes.grid": True,
+    })
+
+    # Binarizar etiquetas: shape (n_samples, num_classes)
+    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+    if y_true_bin.shape[1] == 1:
+        # Caso binario: label_binarize produce (n, 1); expandir a (n, 2)
+        y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
+
+    # Micro-average: tratar todas las columnas OvR como un único problema binario
+    fpr_micro, tpr_micro, _ = roc_curve(
+        y_true_bin.ravel(),
+        y_pred_probs.ravel(),
+    )
+    auc_micro = auc(fpr_micro, tpr_micro)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    ax.plot(
+        fpr_micro,
+        tpr_micro,
+        color="#E63946",
+        lw=2.5,
+        label=f"Micro-average ROC (AUC = {auc_micro:.4f})",
+    )
+    ax.plot(
+        [0, 1], [0, 1],
+        color="#6C757D",
+        lw=1.5,
+        linestyle="--",
+        label="Clasificador aleatorio (AUC = 0.5000)",
+    )
+
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.02])
+    ax.set_xlabel("Tasa de Falsos Positivos (FPR)", labelpad=8)
+    ax.set_ylabel("Tasa de Verdaderos Positivos (TPR / Recall)", labelpad=8)
+    ax.set_title(
+        f"Curva ROC Global — Micro-average\n"
+        f"({num_classes} clases, One-vs-Rest)",
+        pad=12,
+    )
+    ax.legend(loc="lower right", framealpha=0.9)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight")
+        logger.info("Curva ROC micro-average guardada en: %s", save_path)
+
+    if display_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return float(auc_micro)
+
+
+def plot_roc_macro_average(
+    y_true: np.ndarray,
+    y_pred_probs: np.ndarray,
+    class_names: list[str],
+    save_path: str | Path | None = None,
+    display_plot: bool = True,
+) -> float:
+    """Calcula y grafica la curva ROC macro-average para clasificación multi-clase.
+
+    La estrategia macro-average calcula la curva ROC de cada clase de forma
+    independiente (OvR), interpola todas las curvas en un eje FPR común de 1000
+    puntos y promedia las TPR resultantes. Cada clase tiene el mismo peso
+    independientemente de su soporte, lo que la hace sensible a clases con pocos
+    ejemplos.
+
+    El valor AUC macro-average se incluye en la leyenda de la figura. La figura
+    generada tiene calidad de publicación (DPI 150, ejes etiquetados, cuadrícula
+    sutil).
+
+    Compatibilidad: scikit-learn >= 1.0, Python 3.12, TF 2.20, Keras 3.13.
+
+    Args:
+        y_true (np.ndarray): Array 1-D de etiquetas enteras reales con valores en
+            ``[0, num_classes - 1]``. Shape: ``(n_samples,)``.
+        y_pred_probs (np.ndarray): Matriz de probabilidades predichas por el modelo.
+            Shape: ``(n_samples, num_classes)``.
+        class_names (list[str]): Lista ordenada de nombres de clases. Su longitud
+            determina ``num_classes``.
+        save_path (str | Path, optional): Ruta completa donde se guardará la figura
+            (p. ej. ``CACHE_PATH / 'XAI' / 'roc_macro.png'``). Si es ``None``, la
+            figura no se guarda en disco. Por defecto es ``None``.
+        display_plot (bool, optional): Si es ``True``, llama a ``plt.show()`` para
+            mostrar la figura. Por defecto es ``True``.
+
+    Returns:
+        float: Valor del AUC macro-average calculado sobre las TPR interpoladas.
+
+    Raises:
+        ValueError: Si ``y_pred_probs.shape[1]`` no coincide con ``len(class_names)``.
+    """
+    import logging
+    from sklearn.metrics import roc_curve, auc
+    from sklearn.preprocessing import label_binarize
+
+    logger = logging.getLogger(__name__)
+
+    num_classes = len(class_names)
+    if y_pred_probs.shape[1] != num_classes:
+        raise ValueError(
+            f"y_pred_probs tiene {y_pred_probs.shape[1]} columnas "
+            f"pero class_names tiene {num_classes} elementos."
+        )
+
+    # --- Estilo de publicación (independiente de _apply_plot_style) ---
+    plt.rcParams.update({
+        "figure.dpi": 150,
+        "figure.figsize": (8, 7),
+        "axes.titlesize": 15,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "legend.fontsize": 11,
+        "font.size": 11,
+        "axes.grid": True,
+    })
+
+    # Binarizar etiquetas
+    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+    if y_true_bin.shape[1] == 1:
+        y_true_bin = np.hstack([1 - y_true_bin, y_true_bin])
+
+    # Eje FPR común para la interpolación de todas las curvas OvR
+    fpr_grid = np.linspace(0.0, 1.0, 1000)
+    tpr_per_class = np.zeros((num_classes, len(fpr_grid)))
+    auc_per_class = np.zeros(num_classes)
+
+    for i in range(num_classes):
+        fpr_i, tpr_i, _ = roc_curve(y_true_bin[:, i], y_pred_probs[:, i])
+        auc_per_class[i] = auc(fpr_i, tpr_i)
+        # Interpolar TPR en el eje FPR común y anclar en (0, 0)
+        tpr_per_class[i] = np.interp(fpr_grid, fpr_i, tpr_i)
+        tpr_per_class[i][0] = 0.0
+
+    # Macro-average: media aritmética de las TPR interpoladas y anclar en (1, 1)
+    mean_tpr = np.mean(tpr_per_class, axis=0)
+    mean_tpr[-1] = 1.0
+    auc_macro = auc(fpr_grid, mean_tpr)
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    ax.plot(
+        fpr_grid,
+        mean_tpr,
+        color="#2A9D8F",
+        lw=2.5,
+        label=f"Macro-average ROC (AUC = {auc_macro:.4f})",
+    )
+    ax.plot(
+        [0, 1], [0, 1],
+        color="#6C757D",
+        lw=1.5,
+        linestyle="--",
+        label="Clasificador aleatorio (AUC = 0.5000)",
+    )
+
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.02])
+    ax.set_xlabel("Tasa de Falsos Positivos (FPR)", labelpad=8)
+    ax.set_ylabel("Tasa de Verdaderos Positivos (TPR / Recall)", labelpad=8)
+    ax.set_title(
+        f"Curva ROC Global — Macro-average\n"
+        f"({num_classes} clases, OvR, interpolación en {len(fpr_grid)} puntos)",
+        pad=12,
+    )
+    ax.legend(loc="lower right", framealpha=0.9)
+    ax.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight")
+        logger.info("Curva ROC macro-average guardada en: %s", save_path)
+
+    if display_plot:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return float(auc_macro)
