@@ -1230,15 +1230,6 @@ def build_model(
     hasta una capa determinada para ajuste fino (fine-tuning). Añade una cabeza de
     clasificación personalizada con Regularización Dropout y una capa Softmax final.
 
-    Comportamiento de BatchNormalization:
-        - Si ``fine_tune_at`` es None (extracción de características): el extractor
-          se ejecuta con ``training=False``, de modo que las capas BN usan sus
-          estadísticas móviles de ImageNet y no se corrompen durante el entrenamiento
-          de la cabeza.
-        - Si ``fine_tune_at`` es un entero (ajuste fino): el extractor se ejecuta
-          con ``training=True``, permitiendo que las capas BN descongeladas
-          actualicen correctamente sus estadísticas móviles durante el fine-tuning.
-
     Args:
         num_classes (int): Cantidad de clases en la capa de salida.
         input_shape (tuple[int, int, int], optional): Dimensiones de entrada (alto, ancho, canales).
