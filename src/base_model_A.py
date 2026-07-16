@@ -171,7 +171,7 @@ class AugmentationConfig:
     4 grupos de augmentación (geométrico, fotométrico, desenfoque/ruido,
     borrado aleatorio) y solo se aplican las operaciones de ese grupo.
     Cuando es False (por defecto) se aplican todas las operaciones habilitadas
-    de forma independiente, preservando el comportamiento original."""
+    de forma independiente."""
     # Nota: los docstrings de campos en dataclasses se documentan arriba en el
     # docstring de clase; este comentario sirve de referencia inline.
 
