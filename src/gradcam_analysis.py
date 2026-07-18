@@ -236,7 +236,7 @@ def compute_gradcam_batch(
 
     normalized_heatmaps = []
     for i in range(len(heatmaps_np)):
-        h = heatmaps_np[i]
+        h = heatmaps_np[i].astype(np.float32)
         h_max = h.max()
         h_min = h.min()
 
