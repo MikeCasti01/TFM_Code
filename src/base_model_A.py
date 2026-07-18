@@ -297,10 +297,8 @@ def build_model(
             Por defecto es (224, 224, 3).
         learning_rate (float, optional): Tasa de aprendizaje inicial para el optimizador.
             Por defecto es 1e-4.
-        fine_tune_at (int, optional): Índice de capa a partir del cual se descongelarán
-            las capas del extractor de características para el ajuste fino.
-            Si es None, se congela por completo el extractor y se usa ``training=False``
-            en el extractor. Si se especifica un entero, se usa ``training=True``.
+        fine_tune_at (str, optional): capa a partir del cual se descongelarán
+            las capas del extractor de características para el ajuste fino.            
         optimizer_name (str, optional): Nombre del optimizador a usar.
             'adamw', o 'adam'.
         weight_decay (float, optional): Tasa de decaimiento de peso para optimizadores
