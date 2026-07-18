@@ -363,7 +363,7 @@ def build_model(
     x = base_model(inputs, training=bn_training_mode)
 
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.5)(x)
+    x = layers.Dropout(0.3)(x)
     outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
 
     model = keras.Model(inputs, outputs)
