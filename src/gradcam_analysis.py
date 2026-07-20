@@ -550,7 +550,7 @@ def run_average_gradcam_analysis(
     backbone_name: str = "ResNet152",
     target_size: Tuple[int, int] = (224, 224),
     display_plots: bool = False,
-    chunk_size: int = 32,
+    chunk_size: int = 16,
     random_seed: int = 42,
 ) -> dict[str, Any]:
     """Calcula el promedio y la desviación estándar de los mapas Grad-CAM
