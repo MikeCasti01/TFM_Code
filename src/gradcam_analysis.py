@@ -1,16 +1,3 @@
-"""Módulo para el análisis y generación de explicaciones visuales mediante Grad-CAM.
-
-Este módulo implementa el cálculo de mapas de activación (heatmaps) utilizando
-Grad-CAM, compatible con TensorFlow 2.20 y Keras 3.13. Permite analizar el
-comportamiento del modelo sobre las clases débiles identificadas.
-
-Compatibilidad:
---------------
-- Python 3.12
-- TensorFlow 2.20
-- Keras 3.13
-"""
-
 from __future__ import annotations
 
 import json
@@ -20,7 +7,6 @@ from typing import Any, List, Tuple, Union, Optional
 
 import cv2
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -103,7 +89,7 @@ def build_gradcam_model(
 
     Identifica la capa convolucional objetivo (por nombre o autodetectando la última)
     y retorna un nuevo modelo de Keras que genera como salida tanto las activaciones
-    de dicha capa como la predicción final de la red. Soporta modelos aninados.
+    de dicha capa como la predicción final de la red. Soporta modelos anidados.
 
     Args:
         model (keras.Model): Modelo funcional entrenado.
@@ -497,44 +483,56 @@ def _select_samples(
     y_pred_proba: np.ndarray,
     y_pred: np.ndarray,
     random_seed: int = 42,
+    offset: int = 0,
 ) -> np.ndarray:
     """Selecciona de manera determinista un número de muestras a partir de los índices dados,
-    siguiendo la estrategia seleccionada ('first', 'highest_confidence', 'lowest_confidence', 'random').
+    siguiendo la estrategia seleccionada ('first', 'highest_confidence', 'lowest_confidence', 'random')
+    y aplicando un offset inicial.
+
+    Args:
+        indices (np.ndarray): Índices candidatos.
+        strategy (str): Estrategia de selección ('first', 'highest_confidence', 'lowest_confidence', 'random').
+        num_samples (int): Cantidad máxima de muestras a seleccionar.
+        y_pred_proba (np.ndarray): Matriz de probabilidades predichas por el modelo.
+        y_pred (np.ndarray): Vector de clases predichas.
+        random_seed (int): Semilla para reproducibilidad de la estrategia 'random'.
+        offset (int): Número de muestras a omitir desde el inicio del conjunto ordenado.
+
+    Returns:
+        np.ndarray: Subconjunto de índices seleccionados.
     """
     if len(indices) == 0:
         return indices
 
-    # Evitar seleccionar más de lo disponible
-    n_select = min(num_samples, len(indices))
-
     if strategy == "first":
-        selected_indices = indices[:n_select]
+        ordered_indices = indices
     elif strategy == "highest_confidence":
         # Confianza de la predicción: la probabilidad de la clase predicha por el modelo
         confidences = y_pred_proba[indices, y_pred[indices]]
         # Ordenar descendente
         sorted_order = np.argsort(confidences)[::-1]
-        selected_indices = indices[sorted_order[:n_select]]
+        ordered_indices = indices[sorted_order]
     elif strategy == "lowest_confidence":
         # Confianza de la predicción: la probabilidad de la clase predicha por el modelo
         confidences = y_pred_proba[indices, y_pred[indices]]
         # Ordenar ascendente
         sorted_order = np.argsort(confidences)
-        selected_indices = indices[sorted_order[:n_select]]
+        ordered_indices = indices[sorted_order]
     elif strategy == "random":
         # Selección aleatoria determinista
         rng = np.random.default_rng(random_seed)
         shuffled_indices = indices.copy()
         rng.shuffle(shuffled_indices)
-        selected_indices = shuffled_indices[:n_select]
+        ordered_indices = shuffled_indices
     else:
         raise ValueError(f"Estrategia de selección no soportada: {strategy}")
 
+    selected_indices = ordered_indices[offset : offset + num_samples]
     return selected_indices
 
 
 # ---------------------------------------------------------------------------
-# Nuevas funciones extraídas y extendidas
+# Funciones de análisis Grad-CAM
 # ---------------------------------------------------------------------------
 
 def run_average_gradcam_analysis(
@@ -689,6 +687,263 @@ def run_average_gradcam_analysis(
     return class_summary
 
 
+def run_correct_classification_gradcam_analysis(
+    gradcam_model: keras.Model,
+    test_metadata: pd.DataFrame,
+    class_names: list[str],
+    weak_class: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_pred_proba: np.ndarray,
+    output_dir: str | Path,
+    num_examples_per_case: int = 1,
+    sample_selection_strategy: str = "first",
+    backbone_name: str = "ResNet152",
+    target_size: Tuple[int, int] = (224, 224),
+    display_plots: bool = False,
+    random_seed: int = 42,
+) -> List[Path]:
+    """Genera y guarda análisis Grad-CAM para muestras clasificadas correctamente de una clase.
+
+    Para cada muestra seleccionada, produce una figura de 2 columnas:
+    1. Imagen original.
+    2. Mapa Grad-CAM superpuesto para la clase verdadera.
+
+    Args:
+        gradcam_model (keras.Model): Modelo Grad-CAM de doble salida.
+        test_metadata (pd.DataFrame): Metadatos alineados del test split.
+        class_names (list[str]): Lista de nombres de clases.
+        weak_class (str): Nombre de la clase a analizar.
+        y_true (np.ndarray): Etiquetas reales del conjunto de pruebas.
+        y_pred (np.ndarray): Predicciones argmax del conjunto de pruebas.
+        y_pred_proba (np.ndarray): Probabilidades de predicción.
+        output_dir (str | Path): Directorio de salida.
+        num_examples_per_case (int): Número de ejemplos a analizar.
+        sample_selection_strategy (str): Estrategia de selección de muestras.
+        backbone_name (str): Nombre del backbone utilizado.
+        target_size (Tuple[int, int]): Dimensiones espaciales del modelo.
+        display_plots (bool): Si es True, muestra la figura en el notebook.
+        random_seed (int): Semilla para reproducibilidad.
+
+    Returns:
+        List[Path]: Lista de rutas de imágenes guardadas.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    c_idx = class_names.index(weak_class)
+    correct_idxs = np.where((y_true == c_idx) & (y_pred == c_idx))[0]
+
+    logger.info(
+        "=== Análisis Grad-CAM de muestras correctas | Clase: '%s' | Disponibles: %d ===",
+        weak_class,
+        len(correct_idxs),
+    )
+
+    if len(correct_idxs) == 0:
+        logger.warning("No se encontraron muestras correctas para la clase '%s'", weak_class)
+        return []
+
+    selected_correct = _select_samples(
+        indices=correct_idxs,
+        strategy=sample_selection_strategy,
+        num_samples=num_examples_per_case,
+        y_pred_proba=y_pred_proba,
+        y_pred=y_pred,
+        random_seed=random_seed,
+    )
+
+    alpha = 0.5
+    def overlay_h(img, h):
+        h_uint8 = np.uint8(255 * h)
+        color = cv2.applyColorMap(h_uint8, cv2.COLORMAP_JET)
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+        return cv2.addWeighted(img, 1.0 - alpha, color, alpha, 0)
+
+    saved_paths = []
+    for i, c_idx_sel in enumerate(selected_correct):
+        c_path = test_metadata.iloc[c_idx_sel]["Absolute Path"]
+        c_raw = _load_raw_image(c_path, target_size)
+        c_prep = np.expand_dims(_preprocess_image(c_raw, backbone_name), axis=0)
+
+        c_heatmap = compute_gradcam(gradcam_model, c_prep, c_idx)
+        c_overlay = overlay_h(c_raw, c_heatmap)
+        c_conf = float(y_pred_proba[c_idx_sel, c_idx])
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+        axes[0].imshow(c_raw)
+        axes[0].set_title(f"Correct Image (True: {weak_class})\nTrue class confidence: {c_conf:.4f}")
+        axes[0].axis("off")
+
+        axes[1].imshow(c_overlay)
+        axes[1].set_title(f"Correct Grad-CAM (True Class)\nTrue class confidence: {c_conf:.4f}")
+        axes[1].axis("off")
+
+        plt.tight_layout()
+        plot_path = output_dir / f"correct_gradcam_{weak_class.replace(' ', '_')}_sample_{i}.png"
+        plt.savefig(str(plot_path), bbox_inches="tight", dpi=150)
+        saved_paths.append(plot_path)
+
+        if display_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        logger.info("Gráfico de muestra correcta guardado en: %s", plot_path)
+
+    return saved_paths
+
+
+def run_misclassified_gradcam_analysis(
+    gradcam_model: keras.Model,
+    test_metadata: pd.DataFrame,
+    class_names: list[str],
+    weak_class: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_pred_proba: np.ndarray,
+    output_dir: str | Path,
+    num_examples_per_case: int = 1,
+    sample_selection_strategy: str = "first",
+    offset: int = 0,
+    backbone_name: str = "ResNet152",
+    target_size: Tuple[int, int] = (224, 224),
+    display_plots: bool = False,
+    random_seed: int = 42,
+) -> List[Path]:
+    """Genera y guarda análisis Grad-CAM para muestras mal clasificadas de una clase.
+
+    Para cada muestra seleccionada, produce una figura de 3 columnas:
+    1. Imagen original mal clasificada.
+    2. Mapa Grad-CAM superpuesto para la clase verdadera.
+    3. Mapa Grad-CAM superpuesto para la clase predicha.
+
+    Interacción de offset, num_examples_per_case y sample_selection_strategy:
+    - Primero, se identifican las muestras mal clasificadas (y_true == weak_class, y_pred != weak_class).
+    - Luego, se ordenan los candidatos según sample_selection_strategy ('first', 'highest_confidence',
+      'lowest_confidence', 'random').
+    - A continuación, se omiten los primeros `offset` elementos y se toman hasta `num_examples_per_case`
+      elementos desde esa posición: ordered[offset : offset + num_examples_per_case].
+
+    Args:
+        gradcam_model (keras.Model): Modelo Grad-CAM de doble salida.
+        test_metadata (pd.DataFrame): Metadatos alineados del test split.
+        class_names (list[str]): Lista de nombres de clases.
+        weak_class (str): Nombre de la clase real a analizar.
+        y_true (np.ndarray): Etiquetas reales del conjunto de pruebas.
+        y_pred (np.ndarray): Predicciones argmax del conjunto de pruebas.
+        y_pred_proba (np.ndarray): Probabilidades de predicción.
+        output_dir (str | Path): Directorio de salida.
+        num_examples_per_case (int): Número de ejemplos a analizar.
+        sample_selection_strategy (str): Estrategia de selección de muestras.
+        offset (int): Posición inicial de selección tras el ordenamiento.
+        backbone_name (str): Nombre del backbone utilizado.
+        target_size (Tuple[int, int]): Dimensiones espaciales del modelo.
+        display_plots (bool): Si es True, muestra la figura en el notebook.
+        random_seed (int): Semilla para reproducibilidad.
+
+    Returns:
+        List[Path]: Lista de rutas de imágenes guardadas.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    c_idx = class_names.index(weak_class)
+    error_idxs = np.where((y_true == c_idx) & (y_pred != c_idx))[0]
+
+    logger.info(
+        "=== Análisis Grad-CAM de muestras mal clasificadas | Clase: '%s' | Disponibles: %d | Offset: %d ===",
+        weak_class,
+        len(error_idxs),
+        offset,
+    )
+
+    if len(error_idxs) == 0:
+        logger.warning("No se encontraron muestras mal clasificadas para la clase '%s'", weak_class)
+        return []
+
+    selected_error = _select_samples(
+        indices=error_idxs,
+        strategy=sample_selection_strategy,
+        num_samples=num_examples_per_case,
+        y_pred_proba=y_pred_proba,
+        y_pred=y_pred,
+        random_seed=random_seed,
+        offset=offset,
+    )
+
+    if len(selected_error) == 0:
+        logger.warning(
+            "El offset %d sobrepasa el número disponible de errores (%d) para la clase '%s'",
+            offset,
+            len(error_idxs),
+            weak_class,
+        )
+        return []
+
+    alpha = 0.5
+    def overlay_h(img, h):
+        h_uint8 = np.uint8(255 * h)
+        color = cv2.applyColorMap(h_uint8, cv2.COLORMAP_JET)
+        color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
+        return cv2.addWeighted(img, 1.0 - alpha, color, alpha, 0)
+
+    saved_paths = []
+    for i, e_idx_sel in enumerate(selected_error):
+        e_path = test_metadata.iloc[e_idx_sel]["Absolute Path"]
+        e_raw = _load_raw_image(e_path, target_size)
+        e_prep = np.expand_dims(_preprocess_image(e_raw, backbone_name), axis=0)
+
+        pred_class_idx = y_pred[e_idx_sel]
+        pred_class_label = class_names[pred_class_idx]
+
+        e_heatmap_true = compute_gradcam(gradcam_model, e_prep, c_idx)
+        e_heatmap_pred = compute_gradcam(gradcam_model, e_prep, pred_class_idx)
+
+        e_overlay_true = overlay_h(e_raw, e_heatmap_true)
+        e_overlay_pred = overlay_h(e_raw, e_heatmap_pred)
+
+        e_true_conf = float(y_pred_proba[e_idx_sel, c_idx])
+        e_pred_conf = float(y_pred_proba[e_idx_sel, pred_class_idx])
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+        axes[0].imshow(e_raw)
+        axes[0].set_title(
+            f"Misclassified Image\nTrue: {weak_class} | Pred: {pred_class_label}\n"
+            f"True class confidence: {e_true_conf:.4f}\n"
+            f"Predicted class confidence: {e_pred_conf:.4f}"
+        )
+        axes[0].axis("off")
+
+        axes[1].imshow(e_overlay_true)
+        axes[1].set_title(
+            f"Grad-CAM (True Class)\nClass: {weak_class}\nTrue class confidence: {e_true_conf:.4f}"
+        )
+        axes[1].axis("off")
+
+        axes[2].imshow(e_overlay_pred)
+        axes[2].set_title(
+            f"Grad-CAM (Predicted Class)\nClass: {pred_class_label}\nPredicted class confidence: {e_pred_conf:.4f}"
+        )
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        plot_path = output_dir / f"misclassified_gradcam_{weak_class.replace(' ', '_')}_sample_{offset + i}.png"
+        plt.savefig(str(plot_path), bbox_inches="tight", dpi=150)
+        saved_paths.append(plot_path)
+
+        if display_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        logger.info("Gráfico de muestra mal clasificada guardado en: %s", plot_path)
+
+    return saved_paths
+
+
 def run_confused_pair_comparison(
     gradcam_model: keras.Model,
     test_metadata: pd.DataFrame,
@@ -706,7 +961,7 @@ def run_confused_pair_comparison(
     display_plots: bool = False,
     random_seed: int = 42,
 ) -> None:
-    """Genera la segunda visualización contrastiva de parejas de confusión.
+    """Genera la visualización contrastiva de parejas de confusión.
     Para la clase débil, recorre cada una de sus clases confundidas (predichas
     incorrectamente). Para cada par confundido, selecciona n_examples_per_confused_class
     ejemplos de error y los compara lado a lado con una imagen de referencia
@@ -848,287 +1103,3 @@ def run_confused_pair_comparison(
             else:
                 plt.close(fig)
             logger.info("Gráfico comparativo de pareja guardado en: %s", save_file_path)
-
-
-# ---------------------------------------------------------------------------
-# Orquestación de diagnósticos
-# ---------------------------------------------------------------------------
-
-def run_gradcam_diagnostics(
-    gradcam_model: keras.Model,
-    test_metadata: pd.DataFrame,
-    class_names: list[str],
-    weak_class: str,
-    misclassified: dict[str, dict[str, list[str]]],
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    y_pred_proba: np.ndarray,
-    output_dir: str | Path,
-    backbone_name: str = "ResNet152",
-    target_size: Tuple[int, int] = (224, 224),
-    display_plots: bool = False,
-    num_examples_per_case: int = 1,
-    sample_selection_strategy: str = "first",
-    random_seed: int = 42,
-    n_examples_per_confused_class: int = 1,
-) -> dict[str, Any]:
-    """Ejecuta el pipeline completo de diagnósticos de Grad-CAM para una única clase débil.
-
-    Realiza los siguientes pasos de análisis sobre la clase indicada:
-
-    1. Carga o calcula el promedio Grad-CAM y Desviación Estándar de muestras clasificadas correctamente.
-    2. Comparación de mapa Grad-CAM de muestras correctas vs erróneas (en 2 filas con subplots organizados).
-    3. Visualización contrastiva de la muestra errónea con la clase más confundida (1x3 subplots con etiquetas de confianza).
-    4. Ejecución del nuevo análisis confused-pair reference comparison para todos los errores de la clase débil.
-    5. Generación de métricas de consistencia de Grad-CAM guardadas en summary.json.
-
-    Args:
-        gradcam_model (keras.Model): Modelo Grad-CAM pre-construido.
-        test_metadata (pd.DataFrame): Metadatos alineados del test split.
-        class_names (list[str]): Nombres ordenados de las clases.
-        weak_class (str): Nombre de la clase débil a analizar.
-        misclassified (dict): Muestras mal clasificadas del módulo anterior.
-        y_true (np.ndarray): Etiquetas reales del conjunto de pruebas.
-        y_pred (np.ndarray): Predicciones argmax del conjunto de pruebas.
-        y_pred_proba (np.ndarray): Probabilidades de predicción.
-        output_dir (str | Path): Directorio de salida.
-        backbone_name (str): Nombre del backbone usado.
-        target_size (Tuple[int, int]): Dimensiones espaciales del modelo.
-        display_plots (bool): Si es True, muestra los gráficos en el notebook. Por defecto False.
-        num_examples_per_case (int): Número de ejemplos a analizar para cada caso. Por defecto 1.
-        sample_selection_strategy (str): Estrategia de selección de muestras. Por defecto "first".
-        random_seed (int): Semilla para reproducibilidad de la selección aleatoria. Por defecto 42.
-        n_examples_per_confused_class (int): Número de ejemplos por clase confundida en el nuevo análisis. Por defecto 1.
-
-    Returns:
-        dict[str, Any]: Resumen de resultados diagnósticos de la clase procesada.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    c_idx = class_names.index(weak_class)
-    logger.info("=== Iniciando diagnóstico Grad-CAM para clase débil: '%s' ===", weak_class)
-
-    # 1. Identificar índices correctos y erróneos
-    correct_idxs = np.where((y_true == c_idx) & (y_pred == c_idx))[0]
-    error_idxs = np.where((y_true == c_idx) & (y_pred != c_idx))[0]
-
-    logger.info(
-        "Clase '%s' -> Muestras correctas: %d | Errores: %d",
-        weak_class,
-        len(correct_idxs),
-        len(error_idxs),
-    )
-
-    # Cargar/computar métricas promedio (de la clase débil, muestras correctas)
-    summary_path_correct = output_dir / f"summary_average_{weak_class.replace(' ', '_')}_correct.json"
-    if summary_path_correct.exists():
-        with open(summary_path_correct, "r", encoding="utf-8") as f:
-            avg_summary = json.load(f)
-        avg_confidence = avg_summary["average confidence"]
-        consistency = avg_summary["Grad-CAM consistency"]
-        avg_std = avg_summary["heatmap std"]
-    else:
-        # Si no se ha corrido el análisis de promedio, lo ejecutamos por compatibilidad
-        logger.info("El análisis promedio para correctas no se encuentra. Ejecutando por compatibilidad...")
-        avg_summary = run_average_gradcam_analysis(
-            gradcam_model=gradcam_model,
-            test_metadata=test_metadata,
-            class_names=class_names,
-            weak_class=weak_class,
-            y_true=y_true,
-            y_pred=y_pred,
-            y_pred_proba=y_pred_proba,
-            output_dir=output_dir,
-            sample_type="correct",
-            backbone_name=backbone_name,
-            target_size=target_size,
-            display_plots=display_plots,
-            random_seed=random_seed,
-        )
-        avg_confidence = avg_summary["average confidence"]
-        consistency = avg_summary["Grad-CAM consistency"]
-        avg_std = avg_summary["heatmap std"]
-
-    # 3. Comparación Correcto vs Incorrecto (Organizado en 2 filas usando GridSpec)
-    if len(correct_idxs) > 0 and len(error_idxs) > 0:
-        selected_correct = _select_samples(
-            correct_idxs,
-            sample_selection_strategy,
-            num_examples_per_case,
-            y_pred_proba,
-            y_pred,
-            random_seed,
-        )
-        selected_error = _select_samples(
-            error_idxs,
-            sample_selection_strategy,
-            num_examples_per_case,
-            y_pred_proba,
-            y_pred,
-            random_seed,
-        )
-
-        num_plots = min(len(selected_correct), len(selected_error))
-        for i in range(num_plots):
-            c_idx_sel = selected_correct[i]
-            e_idx_sel = selected_error[i]
-
-            c_path = test_metadata.iloc[c_idx_sel]["Absolute Path"]
-            e_path = test_metadata.iloc[e_idx_sel]["Absolute Path"]
-
-            c_raw = _load_raw_image(c_path, target_size)
-            e_raw = _load_raw_image(e_path, target_size)
-
-            c_prep = np.expand_dims(_preprocess_image(c_raw, backbone_name), axis=0)
-            e_prep = np.expand_dims(_preprocess_image(e_raw, backbone_name), axis=0)
-
-            c_heatmap = compute_gradcam(gradcam_model, c_prep, c_idx)
-            e_heatmap_true = compute_gradcam(gradcam_model, e_prep, c_idx)
-            e_heatmap_pred = compute_gradcam(gradcam_model, e_prep, y_pred[e_idx_sel])
-
-            alpha = 0.5
-            def overlay_h(img, h):
-                h_uint8 = np.uint8(255 * h)
-                color = cv2.applyColorMap(h_uint8, cv2.COLORMAP_JET)
-                color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-                return cv2.addWeighted(img, 1.0 - alpha, color, alpha, 0)
-
-            c_overlay = overlay_h(c_raw, c_heatmap)
-            e_overlay_true = overlay_h(e_raw, e_heatmap_true)
-            e_overlay_pred = overlay_h(e_raw, e_heatmap_pred)
-
-            # Reorganizar el layout en 2 filas utilizando GridSpec
-            fig = plt.figure(figsize=(15, 10))
-            gs = GridSpec(2, 6, figure=fig)
-
-            # Fila 1: Muestras Correctas (2 subplots de ancho 2 en medio de 6 columnas)
-            ax1 = fig.add_subplot(gs[0, 1:3])
-            ax2 = fig.add_subplot(gs[0, 3:5])
-
-            # Fila 2: Muestras Erróneas (3 subplots de ancho 2)
-            ax3 = fig.add_subplot(gs[1, 0:2])
-            ax4 = fig.add_subplot(gs[1, 2:4])
-            ax5 = fig.add_subplot(gs[1, 4:6])
-
-            # Cargar imagen y labels de Correct Sample
-            ax1.imshow(c_raw)
-            c_conf = float(y_pred_proba[c_idx_sel, c_idx])
-            ax1.set_title(f"Correct Image (True: {weak_class})\nTrue class confidence: {c_conf:.4f}")
-            ax1.axis("off")
-
-            ax2.imshow(c_overlay)
-            ax2.set_title(f"Correct Grad-CAM (True Class)\nTrue class confidence: {c_conf:.4f}")
-            ax2.axis("off")
-
-            # Cargar imagen y labels de Misclassified Sample
-            pred_class_label = class_names[y_pred[e_idx_sel]]
-            e_true_conf = float(y_pred_proba[e_idx_sel, c_idx])
-            e_pred_conf = float(y_pred_proba[e_idx_sel, y_pred[e_idx_sel]])
-
-            ax3.imshow(e_raw)
-            ax3.set_title(
-                f"Misclassified Image\nTrue: {weak_class} | Pred: {pred_class_label}\n"
-                f"True class confidence: {e_true_conf:.4f}\n"
-                f"Predicted class confidence: {e_pred_conf:.4f}"
-            )
-            ax3.axis("off")
-
-            ax4.imshow(e_overlay_true)
-            ax4.set_title(f"Grad-CAM (True Class)\nClass: {weak_class}\nTrue class confidence: {e_true_conf:.4f}")
-            ax4.axis("off")
-
-            ax5.imshow(e_overlay_pred)
-            ax5.set_title(f"Grad-CAM (Predicted Class)\nClass: {pred_class_label}\nPredicted class confidence: {e_pred_conf:.4f}")
-            ax5.axis("off")
-
-            plt.tight_layout()
-            vs_plot_path = output_dir / f"correct_vs_misclassified_{weak_class.replace(' ', '_')}_sample_{i}.png"
-            plt.savefig(str(vs_plot_path), bbox_inches="tight", dpi=150)
-            if display_plots:
-                plt.show()
-            else:
-                plt.close(fig)
-            logger.info("Gráfico comparativo guardado en: %s", vs_plot_path)
-
-    # 4. Visualización de pareja confundida (Confused-Pair)
-    class_errors = misclassified.get(weak_class, {})
-    if class_errors:
-        confused_class = max(class_errors, key=lambda k: len(class_errors[k]))
-        confused_idx = class_names.index(confused_class)
-
-        # Obtener todos los índices correspondientes a este confused pair
-        confused_pair_idxs = np.where((y_true == c_idx) & (y_pred == confused_idx))[0]
-        if len(confused_pair_idxs) > 0:
-            selected_confused = _select_samples(
-                confused_pair_idxs,
-                sample_selection_strategy,
-                num_examples_per_case,
-                y_pred_proba,
-                y_pred,
-                random_seed,
-            )
-
-            for i, idx in enumerate(selected_confused):
-                pair_path = test_metadata.iloc[idx]["Absolute Path"]
-                pair_raw = _load_raw_image(pair_path, target_size)
-                pair_prep = np.expand_dims(_preprocess_image(pair_raw, backbone_name), axis=0)
-
-                h_true = compute_gradcam(gradcam_model, pair_prep, c_idx)
-                h_pred = compute_gradcam(gradcam_model, pair_prep, confused_idx)
-
-                pair_plot_path = output_dir / f"confused_pair_{weak_class.replace(' ', '_')}_vs_{confused_class.replace(' ', '_')}_sample_{i}.png"
-                plot_confused_pair_gradcam(
-                    image=pair_raw,
-                    heatmap_true=h_true,
-                    heatmap_pred=h_pred,
-                    true_class_name=weak_class,
-                    pred_class_name=confused_class,
-                    save_path=pair_plot_path,
-                    alpha=0.5,
-                    display_plot=display_plots,
-                    true_class_confidence=float(y_pred_proba[idx, c_idx]),
-                    pred_class_confidence=float(y_pred_proba[idx, confused_idx]),
-                )
-        else:
-            logger.info(
-                "No se encontraron índices para la pareja confundida: %s vs %s",
-                weak_class,
-                confused_class,
-            )
-
-        # 4b. Segunda visualización contrastiva de parejas de confusión (Reference comparison)
-        run_confused_pair_comparison(
-            gradcam_model=gradcam_model,
-            test_metadata=test_metadata,
-            class_names=class_names,
-            weak_class=weak_class,
-            misclassified=misclassified,
-            y_true=y_true,
-            y_pred=y_pred,
-            y_pred_proba=y_pred_proba,
-            output_dir=output_dir,
-            n_examples_per_confused_class=n_examples_per_confused_class,
-            sample_selection_strategy=sample_selection_strategy,
-            backbone_name=backbone_name,
-            target_size=target_size,
-            display_plots=display_plots,
-            random_seed=random_seed,
-        )
-    else:
-        logger.info("Clase '%s' no registra confusiones o errores de clasificación.", weak_class)
-
-    # 5. Construir el resumen de diagnóstico de la clase procesada
-    class_summary: dict[str, Any] = {
-        "class": weak_class,
-        "average confidence": round(avg_confidence, 4),
-        "Grad-CAM consistency": round(consistency, 4),
-        "heatmap std": round(avg_std, 4),
-    }
-
-    summary_path = output_dir / "summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(class_summary, f, indent=4, ensure_ascii=False)
-
-    logger.info("Resumen de diagnósticos Grad-CAM guardado en: %s", summary_path)
-    return class_summary
