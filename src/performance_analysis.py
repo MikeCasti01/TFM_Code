@@ -39,6 +39,8 @@ import tensorflow as tf
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix as sk_confusion_matrix,
+    fbeta_score,
+    matthews_corrcoef,
     precision_recall_fscore_support,
 )
 from tensorflow import keras
@@ -63,8 +65,34 @@ _LEVEL_NAME_MAP: dict[str, str] = {
 }
 
 _SUPPORTED_METRICS: frozenset[str] = frozenset(
-    {"recall", "precision", "f1", "accuracy", "support"}
+    {
+        "recall",
+        "precision",
+        "f1",
+        "f2",
+        "mcc",
+        "accuracy",
+        "support",
+        "train support",
+        "train_support",
+        "train images",
+        "train_images",
+    }
 )
+
+_METRIC_COLUMN_MAP: dict[str, str] = {
+    "recall": "Recall",
+    "precision": "Precision",
+    "f1": "F1",
+    "f2": "F2",
+    "mcc": "MCC",
+    "accuracy": "Accuracy",
+    "support": "Support",
+    "train support": "Train Support",
+    "train_support": "Train Support",
+    "train images": "Train Support",
+    "train_images": "Train Support",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -152,18 +180,27 @@ def compute_per_class_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     class_names: list[str],
+    train_metadata: Optional[pd.DataFrame] = None,
+    taxonomic_level: str = "coarse",
 ) -> pd.DataFrame:
     """Calcula métricas de clasificación para cada clase individualmente.
 
     Utiliza ``precision_recall_fscore_support`` con ``average=None`` para obtener
-    métricas por clase, y ``accuracy_score`` global como referencia. El DataFrame
-    resultante está ordenado de forma **ascendente por Recall** para que las clases
-    más débiles aparezcan primero, facilitando su identificación directa.
+    métricas por clase, ``fbeta_score`` con beta=2 para F2-score por clase,
+    one-vs-rest binary ``matthews_corrcoef`` para MCC por clase, y ``accuracy_score``
+    global como referencia. Opcionalmente cuenta el soporte de entrenamiento desde ``train_metadata``.
+
+    El DataFrame resultante está ordenado de forma **ascendente por Recall** para que las
+    clases más débiles aparezcan primero, facilitando su identificación directa.
 
     Args:
         y_true (np.ndarray): Etiquetas reales, shape ``(n_samples,)``.
         y_pred (np.ndarray): Predicciones argmax del modelo, shape ``(n_samples,)``.
         class_names (list[str]): Lista ordenada de nombres de clases.
+        train_metadata (Optional[pd.DataFrame]): DataFrame opcional del conjunto de entrenamiento
+            para computar el número de imágenes de entrenamiento por clase.
+        taxonomic_level (str): Nivel taxonómico ('coarse', 'fine', 'macro') para extraer la columna
+            de clase en ``train_metadata``. Por defecto es 'coarse'.
 
     Returns:
         pd.DataFrame: DataFrame con las siguientes columnas:
@@ -173,7 +210,10 @@ def compute_per_class_metrics(
         - ``Precision``: Precisión (float).
         - ``Recall``: Exhaustividad / recall (float).
         - ``F1``: Medida F1 (float).
-        - ``Support``: Número de muestras reales de la clase (int).
+        - ``F2``: Medida F2 (beta=2) (float).
+        - ``MCC``: Coeficiente de Correlación de Matthews One-vs-Rest (float).
+        - ``Support``: Número de muestras reales de la clase en test (int).
+        - ``Train Support``: Número de muestras reales de la clase en entrenamiento (int).
         - ``Accuracy``: Exactitud global del modelo (misma para todas las filas).
 
         Ordenado ascendentemente por ``Recall``.
@@ -198,6 +238,49 @@ def compute_per_class_metrics(
         labels=list(range(num_classes)),
         zero_division=0,
     )
+
+    f2_arr = fbeta_score(
+        y_true,
+        y_pred,
+        beta=2.0,
+        average=None,
+        labels=list(range(num_classes)),
+        zero_division=0,
+    )
+
+    # Coeficiente MCC por clase (One-vs-Rest)
+    mcc_arr = np.zeros(num_classes, dtype=np.float64)
+    for i in range(num_classes):
+        y_true_binary = (y_true == i).astype(np.int32)
+        y_pred_binary = (y_pred == i).astype(np.int32)
+        if len(np.unique(y_true_binary)) <= 1 and len(np.unique(y_pred_binary)) <= 1:
+            mcc_val = 0.0
+        else:
+            try:
+                mcc_val = float(matthews_corrcoef(y_true_binary, y_pred_binary))
+            except Exception:
+                mcc_val = 0.0
+            if np.isnan(mcc_val):
+                mcc_val = 0.0
+        mcc_arr[i] = mcc_val
+
+    # Recuento de imágenes de entrenamiento por clase si train_metadata está disponible
+    train_support_arr = np.zeros(num_classes, dtype=np.int64)
+    if train_metadata is not None:
+        level_lower = taxonomic_level.lower()
+        name_col = _LEVEL_NAME_MAP.get(level_lower, "Coarse")
+        if name_col in train_metadata.columns:
+            counts = train_metadata[name_col].value_counts().to_dict()
+            train_support_arr = np.array(
+                [int(counts.get(name, 0)) for name in class_names], dtype=np.int64
+            )
+        else:
+            logger.warning(
+                "La columna '%s' no está en train_metadata. Columnas: %s.",
+                name_col,
+                list(train_metadata.columns),
+            )
+
     global_accuracy: float = accuracy_score(y_true, y_pred)
 
     df = pd.DataFrame(
@@ -207,7 +290,10 @@ def compute_per_class_metrics(
             "Precision": precision_arr.astype(np.float64),
             "Recall": recall_arr.astype(np.float64),
             "F1": f1_arr.astype(np.float64),
+            "F2": f2_arr.astype(np.float64),
+            "MCC": mcc_arr.astype(np.float64),
             "Support": support_arr.astype(np.int64),
+            "Train Support": train_support_arr.astype(np.int64),
             "Accuracy": global_accuracy,
         }
     )
@@ -233,10 +319,7 @@ def select_weak_classes(
     """Retorna las N clases con peor rendimiento según la métrica especificada.
 
     Ordena el DataFrame de métricas de forma ascendente según ``metric`` y
-    devuelve los nombres de las primeras ``n_classes`` filas. Si
-    ``per_class_metrics`` ya está ordenado por ``metric`` ascendente (como lo
-    retorna :func:`compute_per_class_metrics` con ``metric="recall"``), la
-    función devuelve directamente las primeras ``n_classes`` filas.
+    devuelve los nombres de las primeras ``n_classes`` filas.
 
     Args:
         per_class_metrics (pd.DataFrame): DataFrame retornado por
@@ -246,7 +329,8 @@ def select_weak_classes(
             Por defecto es 15.
         metric (str, optional): Nombre de la métrica a usar como criterio de
             debilidad. Valores permitidos: ``'recall'``, ``'precision'``,
-            ``'f1'``, ``'accuracy'``, ``'support'``. Por defecto es ``'recall'``.
+            ``'f1'``, ``'f2'``, ``'mcc'``, ``'accuracy'``, ``'support'``, ``'train support'``.
+            Por defecto es ``'recall'``.
 
     Returns:
         list[str]: Lista de ``n_classes`` nombres de clases ordenados de menor
@@ -255,10 +339,9 @@ def select_weak_classes(
     Raises:
         ValueError: Si ``metric`` no es uno de los valores permitidos.
         ValueError: Si ``n_classes`` supera el número total de clases disponibles.
-        KeyError: Si la columna ``metric`` (con la primera letra en mayúscula)
-            no existe en ``per_class_metrics``.
+        KeyError: Si la columna correspondiente a ``metric`` no existe en ``per_class_metrics``.
     """
-    metric_lower = metric.lower()
+    metric_lower = metric.lower().strip()
     if metric_lower not in _SUPPORTED_METRICS:
         raise ValueError(
             f"metric='{metric}' no está soportada. "
@@ -272,8 +355,7 @@ def select_weak_classes(
             f"({total_classes})."
         )
 
-    # La columna en el DataFrame tiene la primera letra en mayúscula
-    col_name = metric_lower.capitalize()
+    col_name = _METRIC_COLUMN_MAP.get(metric_lower, metric_lower.capitalize())
     if col_name not in per_class_metrics.columns:
         raise KeyError(
             f"La columna '{col_name}' no existe en per_class_metrics. "

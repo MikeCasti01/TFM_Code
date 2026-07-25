@@ -960,19 +960,47 @@ def run_confused_pair_comparison(
     target_size: Tuple[int, int] = (224, 224),
     display_plots: bool = False,
     random_seed: int = 42,
+    confused_pair_rank: int = 1,
 ) -> None:
-    """Genera la visualización contrastiva de parejas de confusión.
-    Para la clase débil, recorre cada una de sus clases confundidas (predichas
-    incorrectamente). Para cada par confundido, selecciona n_examples_per_confused_class
-    ejemplos de error y los compara lado a lado con una imagen de referencia
-    típica (correctamente clasificada con alta confianza) de la clase predicha.
+    """Genera la visualización contrastiva de parejas de confusión para UN solo par de confusión.
+
+    Para la clase débil, selecciona la clase confundida según el ranking especificado por
+    `confused_pair_rank` (1 = clase más confundida, 2 = segunda más confundida, etc.).
+    Para ese par confundido único, selecciona n_examples_per_confused_class ejemplos de error
+    y los compara lado a lado con una imagen de referencia típica (correctamente clasificada con alta confianza).
 
     Layout de 4 columnas por ejemplo:
     1. Imagen original mal clasificada.
     2. Grad-CAM de la imagen mal clasificada para la clase predicha.
     3. Imagen de referencia (correcta para la clase predicha, alta confianza).
     4. Grad-CAM de la imagen de referencia para su clase verdadera (la predicha).
+
+    Args:
+        gradcam_model (keras.Model): Modelo Grad-CAM de doble salida.
+        test_metadata (pd.DataFrame): Metadatos alineados del test split.
+        class_names (list[str]): Lista de nombres de clases.
+        weak_class (str): Nombre de la clase débil a analizar.
+        misclassified (dict[str, dict[str, list[str]]]): Diccionario de errores extraído.
+        y_true (np.ndarray): Etiquetas reales.
+        y_pred (np.ndarray): Predicciones argmax.
+        y_pred_proba (np.ndarray): Probabilidades predichas.
+        output_dir (str | Path): Directorio de salida.
+        n_examples_per_confused_class (int): Número de ejemplos a visualizar. Por defecto 1.
+        sample_selection_strategy (str): Estrategia de selección de muestras.
+        backbone_name (str): Nombre del backbone.
+        target_size (Tuple[int, int]): Tamaño de entrada.
+        display_plots (bool): Si es True, muestra gráficos.
+        random_seed (int): Semilla aleatoria.
+        confused_pair_rank (int): Posición de ranking de la clase confundida (1-indexed). Por defecto 1.
+
+    Raises:
+        ValueError: Si `confused_pair_rank` < 1.
     """
+    if confused_pair_rank < 1:
+        raise ValueError(
+            f"confused_pair_rank debe ser >= 1, pero se recibió {confused_pair_rank}."
+        )
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -983,7 +1011,30 @@ def run_confused_pair_comparison(
         logger.info("Clase '%s' no registra errores de clasificación.", weak_class)
         return
 
-    logger.info("=== Iniciando comparación de Pareja Confundida de Referencia para '%s' ===", weak_class)
+    # Ordenar las clases confundidas descendentemente por frecuencia de error (y alfabéticamente ante empates)
+    sorted_confused = sorted(
+        class_errors.items(),
+        key=lambda item: (-len(item[1]), item[0]),
+    )
+
+    rank_idx = confused_pair_rank - 1
+    if rank_idx >= len(sorted_confused):
+        logger.warning(
+            "El rango de confusión solicitado (rank=%d) supera las clases confundidas disponibles (%d) para la clase '%s'.",
+            confused_pair_rank,
+            len(sorted_confused),
+            weak_class,
+        )
+        return
+
+    confused_class, paths = sorted_confused[rank_idx]
+    logger.info(
+        "=== Iniciando comparación de Pareja Confundida (Rank %d/%d: '%s' -> '%s') ===",
+        confused_pair_rank,
+        len(sorted_confused),
+        weak_class,
+        confused_class,
+    )
 
     alpha = 0.5
     def overlay_h(img, h):
@@ -992,114 +1043,124 @@ def run_confused_pair_comparison(
         color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
         return cv2.addWeighted(img, 1.0 - alpha, color, alpha, 0)
 
-    for confused_class, paths in class_errors.items():
-        confused_idx = class_names.index(confused_class)
+    confused_idx = class_names.index(confused_class)
 
-        # Encontrar todas las muestras reales que corresponden a este error específico
-        error_idxs = np.where((y_true == c_idx) & (y_pred == confused_idx))[0]
-        if len(error_idxs) == 0:
-            continue
+    # Encontrar todas las muestras reales que corresponden a este error específico
+    error_idxs = np.where((y_true == c_idx) & (y_pred == confused_idx))[0]
+    if len(error_idxs) == 0:
+        logger.warning(
+            "No se encontraron índices de error para '%s' -> '%s'.",
+            weak_class,
+            confused_class,
+        )
+        return
 
-        # Seleccionar muestras de error
-        selected_errors = _select_samples(
-            indices=error_idxs,
-            strategy=sample_selection_strategy,
-            num_samples=n_examples_per_confused_class,
-            y_pred_proba=y_pred_proba,
-            y_pred=y_pred,
-            random_seed=random_seed,
+    # Seleccionar muestras de error
+    selected_errors = _select_samples(
+        indices=error_idxs,
+        strategy=sample_selection_strategy,
+        num_samples=n_examples_per_confused_class,
+        y_pred_proba=y_pred_proba,
+        y_pred=y_pred,
+        random_seed=random_seed,
+    )
+
+    # Buscar la muestra de referencia de la clase confundida (correcta, con máxima confianza)
+    ref_idxs = np.where((y_true == confused_idx) & (y_pred == confused_idx))[0]
+    best_ref_idx = None
+    if len(ref_idxs) > 0:
+        ref_confidences = y_pred_proba[ref_idxs, confused_idx]
+        sorted_ref_order = np.argsort(ref_confidences)[::-1]
+        best_ref_idx = ref_idxs[sorted_ref_order[0]]
+
+    if best_ref_idx is None:
+        logger.warning(
+            "No hay muestras de referencia correctas para la clase confundida '%s'",
+            confused_class,
         )
 
-        # Buscar la muestra de referencia de la clase confundida (correcta, con máxima confianza)
-        ref_idxs = np.where((y_true == confused_idx) & (y_pred == confused_idx))[0]
-        best_ref_idx = None
-        if len(ref_idxs) > 0:
-            ref_confidences = y_pred_proba[ref_idxs, confused_idx]
-            sorted_ref_order = np.argsort(ref_confidences)[::-1]
-            best_ref_idx = ref_idxs[sorted_ref_order[0]]
+    # Cargar y preprocesar la muestra de referencia una vez
+    if best_ref_idx is not None:
+        ref_path = test_metadata.iloc[best_ref_idx]["Absolute Path"]
+        ref_raw = _load_raw_image(ref_path, target_size)
+        ref_prep = np.expand_dims(_preprocess_image(ref_raw, backbone_name), axis=0)
+        heatmap_ref = compute_gradcam(gradcam_model, ref_prep, confused_idx)
+        overlay_ref = overlay_h(ref_raw, heatmap_ref)
+        ref_conf = float(y_pred_proba[best_ref_idx, confused_idx])
 
-        if best_ref_idx is None:
-            logger.warning("No hay muestras de referencia correctas para la clase confundida '%s'", confused_class)
+    for i, idx in enumerate(selected_errors):
+        # Imagen de error
+        err_path = test_metadata.iloc[idx]["Absolute Path"]
+        err_raw = _load_raw_image(err_path, target_size)
+        err_prep = np.expand_dims(_preprocess_image(err_raw, backbone_name), axis=0)
 
-        # Cargar y preprocesar la muestra de referencia una vez
+        # Grad-CAM de error para la clase predicha (confused_idx)
+        heatmap_err_pred = compute_gradcam(gradcam_model, err_prep, confused_idx)
+        overlay_err_pred = overlay_h(err_raw, heatmap_err_pred)
+
+        err_true_conf = float(y_pred_proba[idx, c_idx])
+        err_pred_conf = float(y_pred_proba[idx, confused_idx])
+
+        # Crear figura de 4 columnas
+        fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
+
+        # Col 1: Imagen original del error
+        axes[0].imshow(err_raw)
+        axes[0].set_title(
+            f"Original Misclassified (Rank {confused_pair_rank})\n"
+            f"True: {weak_class} | Pred: {confused_class}\n"
+            f"True class confidence: {err_true_conf:.4f}\n"
+            f"Predicted class confidence: {err_pred_conf:.4f}"
+        )
+        axes[0].axis("off")
+
+        # Col 2: Grad-CAM de la imagen errónea (explicando la clase predicha)
+        axes[1].imshow(overlay_err_pred)
+        axes[1].set_title(
+            f"Grad-CAM (Predicted Class)\n"
+            f"Class: {confused_class}\n"
+            f"Predicted class confidence: {err_pred_conf:.4f}"
+        )
+        axes[1].axis("off")
+
+        # Col 3: Imagen de referencia
         if best_ref_idx is not None:
-            ref_path = test_metadata.iloc[best_ref_idx]["Absolute Path"]
-            ref_raw = _load_raw_image(ref_path, target_size)
-            ref_prep = np.expand_dims(_preprocess_image(ref_raw, backbone_name), axis=0)
-            heatmap_ref = compute_gradcam(gradcam_model, ref_prep, confused_idx)
-            overlay_ref = overlay_h(ref_raw, heatmap_ref)
-            ref_conf = float(y_pred_proba[best_ref_idx, confused_idx])
-
-        for i, idx in enumerate(selected_errors):
-            # Imagen de error
-            err_path = test_metadata.iloc[idx]["Absolute Path"]
-            err_raw = _load_raw_image(err_path, target_size)
-            err_prep = np.expand_dims(_preprocess_image(err_raw, backbone_name), axis=0)
-            
-            # Grad-CAM de error para la clase predicha (confused_idx)
-            heatmap_err_pred = compute_gradcam(gradcam_model, err_prep, confused_idx)
-            overlay_err_pred = overlay_h(err_raw, heatmap_err_pred)
-
-            err_true_conf = float(y_pred_proba[idx, c_idx])
-            err_pred_conf = float(y_pred_proba[idx, confused_idx])
-
-            # Crear figura de 4 columnas
-            fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
-
-            # Col 1: Imagen original del error
-            axes[0].imshow(err_raw)
-            axes[0].set_title(
-                f"Original Misclassified\n"
-                f"True: {weak_class} | Pred: {confused_class}\n"
-                f"True class confidence: {err_true_conf:.4f}\n"
-                f"Predicted class confidence: {err_pred_conf:.4f}"
+            axes[2].imshow(ref_raw)
+            axes[2].set_title(
+                f"Reference Image\n"
+                f"(Correct {confused_class})\n"
+                f"True class confidence: {ref_conf:.4f}"
             )
-            axes[0].axis("off")
+        else:
+            axes[2].text(0.5, 0.5, "No Reference\nImage Available", ha="center", va="center")
+            axes[2].set_title("Reference Image")
+        axes[2].axis("off")
 
-            # Col 2: Grad-CAM de la imagen errónea (explicando la clase predicha)
-            axes[1].imshow(overlay_err_pred)
-            axes[1].set_title(
-                f"Grad-CAM (Predicted Class)\n"
+        # Col 4: Grad-CAM de la imagen de referencia para la clase predicha
+        if best_ref_idx is not None:
+            axes[3].imshow(overlay_ref)
+            axes[3].set_title(
+                f"Grad-CAM (Reference)\n"
                 f"Class: {confused_class}\n"
-                f"Predicted class confidence: {err_pred_conf:.4f}"
+                f"True class confidence: {ref_conf:.4f}"
             )
-            axes[1].axis("off")
+        else:
+            axes[3].text(0.5, 0.5, "No Reference\nGrad-CAM Available", ha="center", va="center")
+            axes[3].set_title("Grad-CAM (Reference)")
+        axes[3].axis("off")
 
-            # Col 3: Imagen de referencia
-            if best_ref_idx is not None:
-                axes[2].imshow(ref_raw)
-                axes[2].set_title(
-                    f"Reference Image\n"
-                    f"(Correct {confused_class})\n"
-                    f"True class confidence: {ref_conf:.4f}"
-                )
-            else:
-                axes[2].text(0.5, 0.5, "No Reference\nImage Available", ha="center", va="center")
-                axes[2].set_title("Reference Image")
-            axes[2].axis("off")
+        plt.tight_layout()
 
-            # Col 4: Grad-CAM de la imagen de referencia para la clase predicha
-            if best_ref_idx is not None:
-                axes[3].imshow(overlay_ref)
-                axes[3].set_title(
-                    f"Grad-CAM (Reference)\n"
-                    f"Class: {confused_class}\n"
-                    f"True class confidence: {ref_conf:.4f}"
-                )
-            else:
-                axes[3].text(0.5, 0.5, "No Reference\nGrad-CAM Available", ha="center", va="center")
-                axes[3].set_title("Grad-CAM (Reference)")
-            axes[3].axis("off")
+        # Guardar figura
+        save_filename = (
+            f"confused_pair_rank{confused_pair_rank}_{weak_class.replace(' ', '_')}"
+            f"_to_{confused_class.replace(' ', '_')}_sample_{i}.png"
+        )
+        save_file_path = output_dir / save_filename
+        plt.savefig(str(save_file_path), bbox_inches="tight", dpi=150)
 
-            plt.tight_layout()
-            
-            # Guardar figura
-            save_filename = f"confused_pair_comparison_{weak_class.replace(' ', '_')}_to_{confused_class.replace(' ', '_')}_sample_{i}.png"
-            save_file_path = output_dir / save_filename
-            plt.savefig(str(save_file_path), bbox_inches="tight", dpi=150)
-            
-            if display_plots:
-                plt.show()
-            else:
-                plt.close(fig)
-            logger.info("Gráfico comparativo de pareja guardado en: %s", save_file_path)
+        if display_plots:
+            plt.show()
+        else:
+            plt.close(fig)
+        logger.info("Gráfico comparativo de pareja guardado en: %s", save_file_path)
