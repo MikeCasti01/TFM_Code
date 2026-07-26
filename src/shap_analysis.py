@@ -368,13 +368,11 @@ def run_shap_analysis(
     grid_side = max(1, int(np.round(np.sqrt(num_superpixels))))
     patch_h = max(1, target_size[0] // grid_side)
     patch_w = max(1, target_size[1] // grid_side)
-    clustering_spec = f"blur({patch_h},{patch_w})"
+    masker_blur = f"blur({patch_h},{patch_w})"
 
     # Construir wrapper y PartitionExplainer de SHAP
     predict_fn = build_shap_predict_fn(model, backbone_name=backbone_name)
-    masker = shap.maskers.Image(
-        "blur(64,64)", target_size + (3,), clustering=clustering_spec
-    )
+    masker = shap.maskers.Image(masker_blur, target_size + (3,))
     explainer = shap.PartitionExplainer(predict_fn, masker)
 
     samples_metadata: list[dict[str, Any]] = []
