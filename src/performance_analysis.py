@@ -586,3 +586,98 @@ def get_misclassified_samples(
         len(weak_classes),
     )
     return misclassified
+
+
+# ---------------------------------------------------------------------------
+# Selección unificada de muestras para XAI
+# ---------------------------------------------------------------------------
+
+def select_xai_sample_indices(
+    indices: np.ndarray,
+    strategy: str = "first",
+    num_samples: int = 1,
+    y_pred_proba: np.ndarray | None = None,
+    y_pred: np.ndarray | None = None,
+    random_seed: int = 42,
+    offset: int = 0,
+) -> np.ndarray:
+    """Selecciona de manera determinista y unificada un subconjunto de índices de muestras
+    para análisis XAI (Grad-CAM, SHAP, etc.).
+
+    Es la fuente única de verdad para la selección de muestras entre distintas técnicas XAI.
+    Estrategias soportadas:
+    - 'first': Preserva el orden original de los candidatos.
+    - 'highest_confidence': Ordena los candidatos descendentemente según la probabilidad
+      predicha por el modelo para la clase predicha (y_pred_proba[idx, y_pred[idx]]).
+    - 'lowest_confidence': Ordena los candidatos ascendentemente según la probabilidad
+      predicha por el modelo para la clase predicha.
+    - 'random': Realiza un barajado aleatorio determinista utilizando np.random.default_rng(random_seed).
+
+    Tras determinar el orden de los candidatos, aplica el parámetro `offset` y selecciona
+    hasta `num_samples` elementos: `ordered_indices[offset : offset + num_samples]`.
+
+    Args:
+        indices (np.ndarray): Array 1D de índices candidatos del dataset original.
+        strategy (str): Estrategia de selección ('first', 'highest_confidence', 'lowest_confidence', 'random').
+            Por defecto 'first'.
+        num_samples (int): Cantidad máxima de muestras a seleccionar. Por defecto 1.
+        y_pred_proba (np.ndarray | None): Matriz de probabilidades predichas (N, num_classes).
+            Requerido para estrategias basadas en confianza.
+        y_pred (np.ndarray | None): Vector de clases predichas (N,).
+            Requerido para estrategias basadas en confianza.
+        random_seed (int): Semilla para la estrategia 'random'. Por defecto 42.
+        offset (int): Posición inicial de selección tras el ordenamiento. Por defecto 0.
+
+    Returns:
+        np.ndarray: Array 1D con los índices seleccionados del dataset original.
+
+    Raises:
+        ValueError: Si `strategy` no es una estrategia válida.
+        ValueError: Si `strategy` requiere `y_pred_proba` o `y_pred` y no son provistos.
+        ValueError: Si `offset` es negativo.
+    """
+    if len(indices) == 0:
+        return np.array([], dtype=indices.dtype if hasattr(indices, "dtype") else int)
+
+    if offset < 0:
+        raise ValueError(f"offset debe ser >= 0, pero se recibió {offset}.")
+
+    if num_samples <= 0:
+        return np.array([], dtype=indices.dtype if hasattr(indices, "dtype") else int)
+
+    strategy_lower = strategy.lower().strip()
+    valid_strategies = {"first", "highest_confidence", "lowest_confidence", "random"}
+    if strategy_lower not in valid_strategies:
+        raise ValueError(
+            f"Estrategia de selección '{strategy}' no soportada. "
+            f"Opciones válidas: {sorted(valid_strategies)}."
+        )
+
+    if strategy_lower in ("highest_confidence", "lowest_confidence"):
+        if y_pred_proba is None or y_pred is None:
+            raise ValueError(
+                f"La estrategia '{strategy}' requiere proporcionar y_pred_proba e y_pred."
+            )
+        # Confianza de la predicción: probabilidad de la clase predicha por el modelo
+        confidences = y_pred_proba[indices, y_pred[indices]]
+        if strategy_lower == "highest_confidence":
+            # Ordenar descendente (usando stable sort para determinismo total ante empates)
+            sorted_order = np.argsort(-confidences, kind="stable")
+        else:  # lowest_confidence
+            # Ordenar ascendente
+            sorted_order = np.argsort(confidences, kind="stable")
+        ordered_indices = indices[sorted_order]
+
+    elif strategy_lower == "random":
+        rng = np.random.default_rng(random_seed)
+        shuffled_indices = indices.copy()
+        rng.shuffle(shuffled_indices)
+        ordered_indices = shuffled_indices
+
+    elif strategy_lower == "first":
+        ordered_indices = indices.copy()
+
+    # Aplicar offset y recortar a num_samples
+    selected_indices = ordered_indices[offset : offset + num_samples]
+    return selected_indices
+

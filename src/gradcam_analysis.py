@@ -13,6 +13,8 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from performance_analysis import select_xai_sample_indices
+
 logger = logging.getLogger(__name__)
 
 
@@ -485,9 +487,8 @@ def _select_samples(
     random_seed: int = 42,
     offset: int = 0,
 ) -> np.ndarray:
-    """Selecciona de manera determinista un número de muestras a partir de los índices dados,
-    siguiendo la estrategia seleccionada ('first', 'highest_confidence', 'lowest_confidence', 'random')
-    y aplicando un offset inicial.
+    """Selecciona de manera determinista un número de muestras a partir de los índices dados
+    delegando a la función unificada select_xai_sample_indices.
 
     Args:
         indices (np.ndarray): Índices candidatos.
@@ -501,34 +502,16 @@ def _select_samples(
     Returns:
         np.ndarray: Subconjunto de índices seleccionados.
     """
-    if len(indices) == 0:
-        return indices
+    return select_xai_sample_indices(
+        indices=indices,
+        strategy=strategy,
+        num_samples=num_samples,
+        y_pred_proba=y_pred_proba,
+        y_pred=y_pred,
+        random_seed=random_seed,
+        offset=offset,
+    )
 
-    if strategy == "first":
-        ordered_indices = indices
-    elif strategy == "highest_confidence":
-        # Confianza de la predicción: la probabilidad de la clase predicha por el modelo
-        confidences = y_pred_proba[indices, y_pred[indices]]
-        # Ordenar descendente
-        sorted_order = np.argsort(confidences)[::-1]
-        ordered_indices = indices[sorted_order]
-    elif strategy == "lowest_confidence":
-        # Confianza de la predicción: la probabilidad de la clase predicha por el modelo
-        confidences = y_pred_proba[indices, y_pred[indices]]
-        # Ordenar ascendente
-        sorted_order = np.argsort(confidences)
-        ordered_indices = indices[sorted_order]
-    elif strategy == "random":
-        # Selección aleatoria determinista
-        rng = np.random.default_rng(random_seed)
-        shuffled_indices = indices.copy()
-        rng.shuffle(shuffled_indices)
-        ordered_indices = shuffled_indices
-    else:
-        raise ValueError(f"Estrategia de selección no soportada: {strategy}")
-
-    selected_indices = ordered_indices[offset : offset + num_samples]
-    return selected_indices
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +855,11 @@ def run_misclassified_gradcam_analysis(
         random_seed=random_seed,
         offset=offset,
     )
+
+    logger.info("Selected sample indices: %s", selected_error.tolist())
+    if len(selected_error) > 0:
+        selected_paths = [str(test_metadata.iloc[idx]["Absolute Path"]) for idx in selected_error]
+        logger.info("Selected image paths: %s", selected_paths)
 
     if len(selected_error) == 0:
         logger.warning(

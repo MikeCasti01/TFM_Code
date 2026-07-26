@@ -28,6 +28,8 @@ import shap
 import tensorflow as tf
 from tensorflow import keras
 
+from performance_analysis import select_xai_sample_indices
+
 logger = logging.getLogger(__name__)
 
 
@@ -251,6 +253,7 @@ def run_shap_analysis(
     backbone_name: str = "ResNet152",
     target_size: tuple[int, int] = (224, 224),
     display_plots: bool = False,
+    sample_selection_strategy: str = "random",
 ) -> dict[str, Any]:
     """Ejecuta el análisis XAI con SHAP PartitionExplainer para una clase débil especificada.
 
@@ -272,11 +275,13 @@ def run_shap_analysis(
         overlay_alpha (float): Opacidad del mapa SHAP superpuesto [0.0, 1.0]. Por defecto 0.5.
         num_examples (int): Cantidad máxima de ejemplos a analizar. Por defecto 3.
         random_seed (int): Semilla para la selección determinista. Por defecto 42.
-        offset (int): Posición inicial tras la mezcla determinista. Por defecto 0.
+        offset (int): Posición inicial tras el ordenamiento determinista. Por defecto 0.
         max_evals (int): Presupuesto máximo de evaluaciones de SHAP. Por defecto 300.
         backbone_name (str): Nombre del backbone utilizado. Por defecto 'ResNet152'.
         target_size (tuple[int, int]): Dimensiones espaciales del modelo. Por defecto (224, 224).
         display_plots (bool): Si es True, muestra los gráficos en el notebook.
+        sample_selection_strategy (str): Estrategia de selección de muestras ('first', 'highest_confidence',
+            'lowest_confidence', 'random'). Por defecto 'random'.
 
     Returns:
         dict[str, Any]: Estructura de resultados detallada del análisis SHAP.
@@ -311,11 +316,12 @@ def run_shap_analysis(
         candidate_idxs = np.where((y_true == c_idx) & (y_pred != c_idx))[0]
 
     logger.info(
-        "=== Iniciando análisis SHAP (%s) | Clase: '%s' | Candidatos disponibles: %d | Offset: %d ===",
+        "=== Iniciando análisis SHAP (%s) | Clase: '%s' | Candidatos disponibles: %d | Offset: %d | Estrategia: %s ===",
         sample_type,
         weak_class,
         len(candidate_idxs),
         offset,
+        sample_selection_strategy,
     )
 
     if len(candidate_idxs) == 0:
@@ -332,16 +338,22 @@ def run_shap_analysis(
             "samples": [],
         }
 
-    # Mezcla determinista
-    rng = np.random.default_rng(random_seed)
-    shuffled_idxs = candidate_idxs.copy()
-    rng.shuffle(shuffled_idxs)
+    # Selección determinista unificada mediante la fuente única de verdad
+    selected_idxs = select_xai_sample_indices(
+        indices=candidate_idxs,
+        strategy=sample_selection_strategy,
+        num_samples=num_examples,
+        y_pred_proba=y_pred_proba,
+        y_pred=y_pred,
+        random_seed=random_seed,
+        offset=offset,
+    )
 
-    if offset >= len(shuffled_idxs):
+    if len(selected_idxs) == 0:
         logger.warning(
             "El offset %d sobrepasa el número de muestras disponibles (%d) para la clase '%s' (%s).",
             offset,
-            len(shuffled_idxs),
+            len(candidate_idxs),
             weak_class,
             sample_type,
         )
@@ -353,7 +365,9 @@ def run_shap_analysis(
             "samples": [],
         }
 
-    selected_idxs = shuffled_idxs[offset : offset + num_examples]
+    logger.info("Selected sample indices: %s", selected_idxs.tolist())
+    selected_paths = [str(test_metadata.iloc[idx]["Absolute Path"]) for idx in selected_idxs]
+    logger.info("Selected image paths: %s", selected_paths)
 
     # Construir wrapper y PartitionExplainer de SHAP
     predict_fn = build_shap_predict_fn(model, backbone_name=backbone_name)
@@ -428,6 +442,7 @@ def run_shap_analysis(
         "weak_class": weak_class,
         "sample_type": sample_type,
         "selected_samples": len(selected_idxs),
+        "sample_selection_strategy": sample_selection_strategy,
         "random_seed": random_seed,
         "offset": offset,
         "max_evals": max_evals,
