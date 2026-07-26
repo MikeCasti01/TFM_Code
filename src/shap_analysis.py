@@ -129,7 +129,7 @@ def plot_shap_contrastive_comparison(
     pred_confidence: float,
     save_path: str | Path | None = None,
     display_plot: bool = False,
-    shap_overlay: bool = False,
+    overlay_shap: bool = False,
     overlay_alpha: float = 0.5,
 ) -> None:
     """Genera una figura de 4 paneles con explicaciones contrastivas de SHAP.
@@ -141,17 +141,17 @@ def plot_shap_contrastive_comparison(
     4. Mapa contrastivo: SHAP(predicha) - SHAP(verdadera).
 
     Args:
-        raw_image: Imagen RGB en formato uint8 o float [0, 1].
-        shap_true: Mapa SHAP 2D para la clase verdadera.
-        shap_pred: Mapa SHAP 2D para la clase predicha.
-        true_class_name: Nombre de la clase real.
-        pred_class_name: Nombre de la clase predicha.
-        true_confidence: Confianza (probabilidad) para la clase real.
-        pred_confidence: Confianza (probabilidad) para la clase predicha.
-        save_path: Ruta donde guardar la figura.
-        display_plot: Si es True, muestra la figura en pantalla.
-        shap_overlay: Si es True, superpone los mapas SHAP sobre la imagen original.
-        overlay_alpha: Transparencia alfa para el overlay [0.0, 1.0]. Por defecto 0.5.
+        raw_image (np.ndarray): Imagen RGB original (H, W, 3).
+        shap_true (np.ndarray): Mapa de atribución SHAP 2D (H, W) para la clase verdadera.
+        shap_pred (np.ndarray): Mapa de atribución SHAP 2D (H, W) para la clase predicha.
+        true_class_name (str): Nombre de la clase verdadera.
+        pred_class_name (str): Nombre de la clase predicha por el modelo.
+        true_confidence (float): Probabilidad softmax predicha para la clase verdadera.
+        pred_confidence (float): Probabilidad softmax predicha para la clase predicha.
+        save_path (str | Path | None): Ruta opcional de guardado para la figura.
+        display_plot (bool): Si es True, muestra la figura en el entorno interactivo.
+        overlay_shap (bool): Si es True, superpone los mapas SHAP sobre la imagen RGB original.
+        overlay_alpha (float): Transparencia del mapa SHAP superpuesto en el rango [0.0, 1.0].
     """
     if not (0.0 <= overlay_alpha <= 1.0):
         raise ValueError(
@@ -180,39 +180,38 @@ def plot_shap_contrastive_comparison(
     axes[0].axis("off")
 
     def plot_attribution(ax: plt.Axes, map_data: np.ndarray, title: str) -> None:
-        if shap_overlay:
-            ax.imshow(img_uint8)
         abs_max = max(abs(np.min(map_data)), abs(np.max(map_data)), 1e-6)
         norm = TwoSlopeNorm(vmin=-abs_max, vcenter=0.0, vmax=abs_max)
-        kwargs: dict[str, Any] = {"cmap": "seismic", "norm": norm}
-        if shap_overlay:
-            kwargs["alpha"] = overlay_alpha
-        im = ax.imshow(map_data, **kwargs)
+
+        if overlay_shap:
+            ax.imshow(img_uint8)
+            im = ax.imshow(map_data, cmap="seismic", norm=norm, alpha=overlay_alpha)
+        else:
+            im = ax.imshow(map_data, cmap="seismic", norm=norm)
+
         ax.set_title(title)
         ax.axis("off")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    mode_str = " (Overlay)" if shap_overlay else ""
 
     # Panel 2: SHAP clase verdadera
     plot_attribution(
         axes[1],
         shap_true,
-        f"SHAP{mode_str} (True Class: {true_class_name})\nRed=Support | Blue=Oppose",
+        f"SHAP (True Class: {true_class_name})\nRed=Support | Blue=Oppose",
     )
 
     # Panel 3: SHAP clase predicha
     plot_attribution(
         axes[2],
         shap_pred,
-        f"SHAP{mode_str} (Pred Class: {pred_class_name})\nRed=Support | Blue=Oppose",
+        f"SHAP (Pred Class: {pred_class_name})\nRed=Support | Blue=Oppose",
     )
 
     # Panel 4: Mapa contrastivo
     plot_attribution(
         axes[3],
         contrastive_map,
-        f"Contrastive{mode_str}: SHAP(Pred) - SHAP(True)\nRed=Favors Pred | Blue=Favors True",
+        f"Contrastive: SHAP(Pred) - SHAP(True)\nRed=Favors Pred | Blue=Favors True",
     )
 
     plt.tight_layout()
@@ -242,6 +241,9 @@ def run_shap_analysis(
     y_pred: np.ndarray,
     y_pred_proba: np.ndarray,
     output_dir: str | Path,
+    sample_type: str = "correct",
+    overlay_shap: bool = False,
+    overlay_alpha: float = 0.5,
     num_examples: int = 3,
     random_seed: int = 42,
     offset: int = 0,
@@ -249,22 +251,25 @@ def run_shap_analysis(
     backbone_name: str = "ResNet152",
     target_size: tuple[int, int] = (224, 224),
     display_plots: bool = False,
-    sample_type: str = "correct",
-    num_superpixels: int = 100,
-    shap_overlay: bool = False,
-    overlay_alpha: float = 0.5,
 ) -> dict[str, Any]:
     """Ejecuta el análisis XAI con SHAP PartitionExplainer para una clase débil especificada.
+
+    Soporta la selección explícita entre muestras correctamente clasificadas ('correct')
+    y muestras mal clasificadas ('misclassified'), así como la superposición visual
+    opcional del mapa divergente SHAP sobre la imagen original.
 
     Args:
         model (keras.Model): Modelo Keras entrenado.
         test_metadata (pd.DataFrame): DataFrame de metadatos alineados del test split.
         class_names (list[str]): Lista ordenada de nombres de clases.
-        weak_class (str): Nombre de la clase débil a analizar (referente a y_true).
+        weak_class (str): Nombre de la clase débil a analizar (clase real).
         y_true (np.ndarray): Etiquetas reales (n_samples,).
         y_pred (np.ndarray): Predicciones argmax (n_samples,).
         y_pred_proba (np.ndarray): Probabilidades predichas (n_samples, num_classes).
         output_dir (str | Path): Directorio de salida para guardar imágenes y resúmenes.
+        sample_type (str): Tipo de muestra a analizar ('correct' o 'misclassified'). Por defecto 'correct'.
+        overlay_shap (bool): Si es True, superpone el mapa divergente SHAP sobre la imagen RGB. Por defecto False.
+        overlay_alpha (float): Opacidad del mapa SHAP superpuesto [0.0, 1.0]. Por defecto 0.5.
         num_examples (int): Cantidad máxima de ejemplos a analizar. Por defecto 3.
         random_seed (int): Semilla para la selección determinista. Por defecto 42.
         offset (int): Posición inicial tras la mezcla determinista. Por defecto 0.
@@ -272,11 +277,6 @@ def run_shap_analysis(
         backbone_name (str): Nombre del backbone utilizado. Por defecto 'ResNet152'.
         target_size (tuple[int, int]): Dimensiones espaciales del modelo. Por defecto (224, 224).
         display_plots (bool): Si es True, muestra los gráficos en el notebook.
-        sample_type (str): Tipo de muestra a seleccionar: 'correct' o 'misclassified'.
-        num_superpixels (int): Número objetivo aproximado de regiones/superpíxeles espaciales
-            para la jerarquía de particionamiento del masker. Por defecto 100.
-        shap_overlay (bool): Si es True, superpone el mapa divergente SHAP sobre la imagen original.
-        overlay_alpha (float): Transparencia alfa para el overlay SHAP [0.0, 1.0].
 
     Returns:
         dict[str, Any]: Estructura de resultados detallada del análisis SHAP.
@@ -288,15 +288,7 @@ def run_shap_analysis(
 
     if sample_type not in {"correct", "misclassified"}:
         raise ValueError(
-            f"sample_type debe ser 'correct' o 'misclassified', pero se recibió '{sample_type}'."
-        )
-
-    if max_evals <= 0:
-        raise ValueError(f"max_evals debe ser > 0, pero se recibió {max_evals}.")
-
-    if num_superpixels <= 0:
-        raise ValueError(
-            f"num_superpixels debe ser > 0, pero se recibió {num_superpixels}."
+            f"sample_type no soportado: '{sample_type}'. Debe ser 'correct' o 'misclassified'."
         )
 
     if not (0.0 <= overlay_alpha <= 1.0):
@@ -304,34 +296,33 @@ def run_shap_analysis(
             f"overlay_alpha debe estar en el rango [0.0, 1.0], pero se recibió {overlay_alpha}."
         )
 
+    if max_evals <= 0:
+        raise ValueError(f"max_evals debe ser > 0, pero se recibió {max_evals}.")
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     c_idx = class_names.index(weak_class)
 
-    # Filtrar candidatos según sample_type
+    # Filtrado según el tipo de muestra especificado
     if sample_type == "correct":
         candidate_idxs = np.where((y_true == c_idx) & (y_pred == c_idx))[0]
-    elif sample_type == "misclassified":
+    else:  # "misclassified"
         candidate_idxs = np.where((y_true == c_idx) & (y_pred != c_idx))[0]
-    else:
-        raise ValueError(
-            f"sample_type debe ser 'correct' o 'misclassified', pero se recibió '{sample_type}'."
-        )
 
     logger.info(
-        "=== Iniciando análisis SHAP | Clase: '%s' | Tipo: '%s' | Candidatos disponibles: %d | Offset: %d ===",
-        weak_class,
+        "=== Iniciando análisis SHAP (%s) | Clase: '%s' | Candidatos disponibles: %d | Offset: %d ===",
         sample_type,
+        weak_class,
         len(candidate_idxs),
         offset,
     )
 
     if len(candidate_idxs) == 0:
         logger.warning(
-            "No hay candidatos disponibles para la clase débil '%s' con sample_type='%s'.",
-            weak_class,
+            "No hay candidatos de tipo '%s' para la clase débil '%s'.",
             sample_type,
+            weak_class,
         )
         return {
             "weak_class": weak_class,
@@ -364,20 +355,12 @@ def run_shap_analysis(
 
     selected_idxs = shuffled_idxs[offset : offset + num_examples]
 
-    # Configuración de superpíxeles/particiones objetivo (~num_superpixels)
-    grid_side = max(1, int(np.round(np.sqrt(num_superpixels))))
-    patch_h = max(1, target_size[0] // grid_side)
-    patch_w = max(1, target_size[1] // grid_side)
-    masker_blur = f"blur({patch_h},{patch_w})"
-
     # Construir wrapper y PartitionExplainer de SHAP
     predict_fn = build_shap_predict_fn(model, backbone_name=backbone_name)
-    masker = shap.maskers.Image(masker_blur, target_size + (3,))
+    masker = shap.maskers.Image("blur(64,64)", target_size + (3,))
     explainer = shap.PartitionExplainer(predict_fn, masker)
 
     samples_metadata: list[dict[str, Any]] = []
-
-    safe_class_name = weak_class.replace(" ", "_")
 
     for i, idx in enumerate(selected_idxs):
         img_path = test_metadata.iloc[idx]["Absolute Path"]
@@ -407,9 +390,9 @@ def run_shap_analysis(
         shap_true_map = _extract_shap_map(shap_res, true_cls_idx)
         shap_pred_map = _extract_shap_map(shap_res, pred_cls_idx)
 
-        # Nombre y ruta de guardado para evitar sobreescritura
+        # Nombre y ruta de guardado sin colisión entre modos
         save_filename = (
-            f"shap_{safe_class_name}_{sample_type}_sample_{offset + i:03d}.png"
+            f"shap_{weak_class.replace(' ', '_')}_{sample_type}_sample_{offset + i:03d}.png"
         )
         save_file_path = output_dir / save_filename
 
@@ -423,7 +406,7 @@ def run_shap_analysis(
             pred_confidence=pred_conf,
             save_path=save_file_path,
             display_plot=display_plots,
-            shap_overlay=shap_overlay,
+            overlay_shap=overlay_shap,
             overlay_alpha=overlay_alpha,
         )
 
@@ -437,6 +420,7 @@ def run_shap_analysis(
             "shap_plot_path": str(save_file_path),
             "true_class_idx": true_cls_idx,
             "predicted_class_idx": pred_cls_idx,
+            "sample_type": sample_type,
         }
         samples_metadata.append(sample_info)
 
@@ -447,18 +431,17 @@ def run_shap_analysis(
         "random_seed": random_seed,
         "offset": offset,
         "max_evals": max_evals,
-        "num_superpixels": num_superpixels,
-        "shap_overlay": shap_overlay,
+        "overlay_shap": overlay_shap,
         "overlay_alpha": overlay_alpha,
         "backbone_name": backbone_name,
         "output_dir": str(output_dir),
         "samples": samples_metadata,
     }
 
-    # Guardar metadata JSON
-    json_path = output_dir / f"shap_summary_{safe_class_name}_{sample_type}.json"
+    # Guardar metadata JSON específica del tipo de muestra
+    json_path = output_dir / f"shap_summary_{weak_class.replace(' ', '_')}_{sample_type}.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(summary_result, f, indent=4, ensure_ascii=False)
 
-    logger.info("Análisis SHAP completado. Resultados guardados en: %s", json_path)
+    logger.info("Análisis SHAP (%s) completado. Resultados guardados en: %s", sample_type, json_path)
     return summary_result
